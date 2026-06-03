@@ -37,9 +37,11 @@ This question is motivated by recent models like **MAI-Thinking-1**, **Llama 4 (
 - Ready for GRPO / PPO-style RL (TRL compatible)
 
 ## Citation
+```bash
 @misc{interleaved-moe-rl,
   title = {Interleaved MoE + RL Dynamics},
   author = {Wesley Lu},
   year = {2026},
-  note = {https://github.com/yourusername/interleaved-moe-rl}
+  note = {https://github.com/wlu314/interleaved-moe-rl}
 }
+```
