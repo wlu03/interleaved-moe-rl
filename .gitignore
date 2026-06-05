@@ -1,0 +1,15 @@
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+*.egg-info/
+dist/
+build/
+dense_vs_moe_architecture.txt
+*.export.txt
+
+# Markdown notes/logs/plans — keep them local. Track only README.md anywhere.
+*.md
+!README.md
+
