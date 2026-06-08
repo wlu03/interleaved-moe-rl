@@ -8,6 +8,14 @@ from .rewards import (
     batch_reward,
     RewardBreakdown,
 )
+from .rollout import (
+    RolloutBatch,
+    sample_next_token,
+    sample_one_prompt,
+    sample_completions,
+    group_advantages,
+    rollout,
+)
 
 __all__ = [
     "extract_gsm8k_answer",
@@ -16,4 +24,10 @@ __all__ = [
     "reward",
     "batch_reward",
     "RewardBreakdown",
+    "RolloutBatch",
+    "sample_next_token",
+    "sample_one_prompt",
+    "sample_completions",
+    "group_advantages",
+    "rollout",
 ]
