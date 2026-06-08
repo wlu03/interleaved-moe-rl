@@ -16,6 +16,14 @@ from .rollout import (
     group_advantages,
     rollout,
 )
+from .grpo import (
+    GRPOConfig,
+    selective_log_softmax,
+    compute_logprobs,
+    shift_completion_mask,
+    grpo_loss,
+    grpo_train_step,
+)
 
 __all__ = [
     "extract_gsm8k_answer",
@@ -30,4 +38,10 @@ __all__ = [
     "sample_completions",
     "group_advantages",
     "rollout",
+    "GRPOConfig",
+    "selective_log_softmax",
+    "compute_logprobs",
+    "shift_completion_mask",
+    "grpo_loss",
+    "grpo_train_step",
 ]
