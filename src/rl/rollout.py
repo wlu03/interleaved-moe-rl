@@ -1,16 +1,12 @@
 """Rollout sampler for GRPO.
 
-Produces a RolloutBatch ready for the GRPO loss: G completions per prompt,
-each with the right masks, group-normalized advantages, and decoded text
-for diagnostic logging.
+Produces a RolloutBatch ready for the loss: G completions per prompt with the
+right masks, group-normalized advantages, and decoded text for logging.
 
-Design choices (locked in NEXT_STEPS.md / IMPLEMENTATION_LOG.md):
-    - Native HF-style autoregressive sampling. No vLLM at this stage.
-    - Per-prompt batching: replicate one prompt G times and sample G
-      completions in one batched forward loop. Avoids left-padding RoPE
-      issues since all rollouts within one prompt share the prompt length.
-    - Dr.GRPO advantage by default (subtract group mean, no std division).
-    - Greedy when temperature == 0; top-p nucleus otherwise.
+We sample natively in PyTorch (no vLLM at this scale) and batch per prompt:
+replicate one prompt G times and generate all G completions together. Because
+the rollouts within a prompt share the same prompt length, we sidestep the
+left-padding RoPE headaches you'd hit batching across prompts.
 """
 
 from __future__ import annotations
@@ -22,27 +18,26 @@ import torch
 import torch.nn.functional as F
 
 
-# ---- Tokenizer protocol so tests don't need a real HF tokenizer --------
 class TokenizerLike(Protocol):
+    """Just enough of a tokenizer for rollout; lets tests use a fake."""
+
     eos_token_id: int
     pad_token_id: int
+
     def encode(self, text: str) -> list[int]: ...
     def decode(self, ids) -> str: ...
 
 
-# ---- Outputs -----------------------------------------------------------
 @dataclass
 class RolloutBatch:
-    """A batch of G * B rollouts ready to feed into GRPO.
+    """A batch of N = B * G rollouts ready to feed into GRPO.
 
-    Tensor shapes — N = B * G (number of rollouts in the batch):
-        input_ids        [N, T_max]   prompt tokens + generated tokens, right-padded
-        attention_mask   [N, T_max]   1 on prompt + active completion tokens
-        completion_mask  [N, T_max]   1 only on generated tokens (incl. EOS)
-        rewards          [N]
-        advantages       [N]          group-mean-centered (Dr.GRPO style)
-        prompt_indices   [N]          which prompt each rollout came from (0..B-1)
-        prompt_lens      [N]          length of the original prompt for that row
+    All 2-D tensors are [N, T_max], right-padded:
+        input_ids        prompt + generated tokens
+        attention_mask   1 on the prompt and active completion tokens
+        completion_mask  1 only on generated tokens (EOS included)
+    The 1-D tensors are [N]: rewards, advantages (group-mean centered),
+    prompt_indices (which prompt, 0..B-1), and prompt_lens.
     """
 
     input_ids: torch.Tensor
@@ -75,22 +70,14 @@ class RolloutBatch:
         )
 
 
-# ---- Sampling primitives ----------------------------------------------
 def sample_next_token(
     logits: torch.Tensor,
     temperature: float = 1.0,
     top_p: float = 1.0,
 ) -> torch.Tensor:
-    """
-    Sample one token per row from logits.
+    """Sample one token per row from [B, V] logits, returning [B] ids.
 
-    Args:
-        logits: [B, V]
-        temperature: 0 → greedy argmax. >0 → temperature-scaled softmax.
-        top_p: top-p (nucleus) cutoff. 1.0 disables filtering.
-
-    Returns:
-        [B] sampled token ids
+    temperature == 0 is greedy argmax. top_p < 1 applies nucleus filtering.
     """
     if temperature <= 0:
         return logits.argmax(dim=-1)
@@ -101,11 +88,9 @@ def sample_next_token(
         sorted_logits, sorted_indices = torch.sort(logits, descending=True, dim=-1)
         sorted_probs = torch.softmax(sorted_logits, dim=-1)
         cumulative = sorted_probs.cumsum(dim=-1)
-        # Keep tokens where cumulative <= top_p, but always include the top-1
         keep = cumulative <= top_p
-        keep[..., 0] = True
+        keep[..., 0] = True  # always keep the top token
         sorted_logits = sorted_logits.masked_fill(~keep, float("-inf"))
-        # Restore original token ordering
         logits_filtered = torch.full_like(logits, float("-inf"))
         logits_filtered.scatter_(-1, sorted_indices, sorted_logits)
         logits = logits_filtered
@@ -114,7 +99,6 @@ def sample_next_token(
     return torch.multinomial(probs, num_samples=1).squeeze(-1)
 
 
-# ---- Per-prompt sampling loop -----------------------------------------
 @torch.no_grad()
 def sample_one_prompt(
     model: torch.nn.Module,
@@ -127,16 +111,10 @@ def sample_one_prompt(
     temperature: float = 1.0,
     top_p: float = 1.0,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """
-    Generate `group_size` completions from a single prompt.
+    """Generate `group_size` completions from a single prompt.
 
-    Returns:
-        seq:             [G, prompt_len + n_generated]  full sequences
-        attention_mask:  [G, ...]  1 on prompt + active completion tokens
-        completion_mask: [G, ...]  1 only on generated tokens (incl. EOS)
-
-    Note: short sequences (those that hit EOS early) are right-padded with
-    `pad_token_id` so all G rows share the same length.
+    Returns (seq, attention_mask, completion_mask), each [G, prompt_len + n].
+    Rows that hit EOS early are right-padded so all G share a length.
     """
     if group_size <= 0:
         raise ValueError(f"group_size must be >= 1, got {group_size}")
@@ -152,7 +130,7 @@ def sample_one_prompt(
         torch.tensor(prompt_ids, dtype=torch.long, device=device)
         .unsqueeze(0)
         .repeat(group_size, 1)
-    )  # [G, L]
+    )
     completion_mask = torch.zeros(group_size, prompt_len, dtype=torch.long, device=device)
     finished = torch.zeros(group_size, dtype=torch.bool, device=device)
 
@@ -162,29 +140,27 @@ def sample_one_prompt(
         for _ in range(max_new_tokens):
             if bool(finished.all().item()):
                 break
-            out = model(seq)
-            logits = out["logits"][:, -1, :]  # [G, V]
+            logits = model(seq)["logits"][:, -1, :]
             next_tokens = sample_next_token(logits, temperature=temperature, top_p=top_p)
 
-            # Where this row already finished, replace with pad (don't generate further)
+            # Finished rows emit pad and stop contributing.
             next_tokens = torch.where(
                 finished,
                 torch.full_like(next_tokens, pad_token_id),
                 next_tokens,
             )
 
-            # Append before updating `finished` so the EOS itself is included with mask=1
+            # Append and mark mask=1 *before* updating `finished`, so the EOS
+            # token itself counts as a completion token but nothing after it.
             seq = torch.cat([seq, next_tokens.unsqueeze(-1)], dim=-1)
             new_mask_col = (~finished).long().unsqueeze(-1)
             completion_mask = torch.cat([completion_mask, new_mask_col], dim=-1)
 
-            # An EOS token marks the end of *this* row's completion
             finished = finished | (next_tokens == eos_token_id)
     finally:
         if was_training:
             model.train()
 
-    # attention_mask = prompt portion (always 1) ∪ valid completion tokens
     attention_mask = torch.zeros_like(seq)
     attention_mask[:, :prompt_len] = 1
     if seq.shape[1] > prompt_len:
@@ -193,7 +169,6 @@ def sample_one_prompt(
     return seq, attention_mask, completion_mask
 
 
-# ---- Multi-prompt aggregation -----------------------------------------
 @torch.no_grad()
 def sample_completions(
     model: torch.nn.Module,
@@ -206,15 +181,10 @@ def sample_completions(
     temperature: float = 1.0,
     top_p: float = 1.0,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """
-    Sample G completions for each prompt and aggregate into uniform tensors.
+    """Sample G completions per prompt and pad everything to a common length.
 
-    Returns:
-        input_ids        [B*G, T_max]
-        attention_mask   [B*G, T_max]
-        completion_mask  [B*G, T_max]
-        prompt_indices   [B*G]
-        prompt_lens      [B*G]
+    Returns (input_ids, attention_mask, completion_mask, prompt_indices,
+    prompt_lens); the first three are [B*G, T_max], the rest [B*G].
     """
     if not prompt_token_ids:
         empty2d = torch.zeros(0, 0, dtype=torch.long)
@@ -265,30 +235,18 @@ def sample_completions(
     )
 
 
-# ---- Advantage normalization (Dr.GRPO default) ------------------------
 def group_advantages(
     rewards: torch.Tensor,
     group_size: int,
     scale_rewards: bool = False,
     eps: float = 1e-8,
 ) -> torch.Tensor:
-    """
-    Compute per-group advantages from per-rollout rewards.
+    """Per-group advantages from per-rollout rewards.
 
-    Assumes rewards are arranged so consecutive blocks of `group_size`
-    rollouts come from the same prompt — this matches `sample_completions`'s
-    output ordering.
-
-    Args:
-        rewards: [B*G] scalar rewards
-        group_size: G — group size used during rollout
-        scale_rewards: if True, divide by per-group std (vanilla GRPO).
-                       If False (default, Dr.GRPO), only subtract mean.
-                       Avoids difficulty bias from std normalization.
-        eps: numerical guard for std
-
-    Returns:
-        [B*G] advantages
+    Rewards must be laid out as consecutive blocks of `group_size` (matching
+    sample_completions). By default we just subtract the group mean (Dr.GRPO);
+    set scale_rewards=True to also divide by the group std (vanilla GRPO),
+    which introduces a difficulty bias toward groups that nearly agree.
     """
     if rewards.ndim != 1:
         raise ValueError(f"rewards must be 1-D, got shape {tuple(rewards.shape)}")
@@ -303,14 +261,12 @@ def group_advantages(
     grouped = rewards.float().view(B, group_size)
     centered = grouped - grouped.mean(dim=1, keepdim=True)
     if scale_rewards:
+        # eps keeps an all-equal group (std == 0) at advantage 0 rather than NaN.
         std = grouped.std(dim=1, keepdim=True, unbiased=False).clamp_min(eps)
-        # When all rewards in a group are equal, std is ~0 → advantage stays 0
-        # (eps in denom ⇒ 0/eps = 0). The clamp is for numerical safety only.
         centered = centered / std
     return centered.reshape(-1)
 
 
-# ---- Top-level rollout API --------------------------------------------
 def rollout(
     model: torch.nn.Module,
     tokenizer: TokenizerLike,
@@ -325,23 +281,11 @@ def rollout(
     reward_fn: Callable[..., float] | None = None,
     scale_rewards: bool = False,
 ) -> RolloutBatch:
-    """
-    Sample, decode, grade, and group-normalize rollouts in one shot.
+    """Sample, decode, grade, and group-normalize rollouts in one call.
 
-    Args:
-        model: an InterleavedMoEModel (or compatible).
-        tokenizer: must expose .encode(str)→list[int], .decode(ids)→str,
-                   .eos_token_id, .pad_token_id
-        prompts: B prompts to sample G completions from each.
-        golds: B ground-truth answer strings (parallel to `prompts`).
-        group_size: rollouts per prompt.
-        max_new_tokens: hard cap on generated tokens.
-        temperature, top_p: sampling controls.
-        step: passed to reward_fn (governs format-bonus phase).
-        reward_fn: signature reward(completion, gold, step=...) → float.
-                   Defaults to src.rl.rewards.reward.
-        scale_rewards: if True, std-normalize advantages within each group
-                       (vanilla GRPO). Default False = Dr.GRPO.
+    `tokenizer` needs encode/decode plus eos_token_id/pad_token_id. `golds`
+    runs parallel to `prompts`. `reward_fn(completion, gold, step=...)`
+    defaults to src.rl.rewards.reward.
     """
     if len(prompts) != len(golds):
         raise ValueError(
@@ -369,7 +313,7 @@ def rollout(
 
     prompt_token_ids = [tokenizer.encode(p) for p in prompts]
     if any(len(p) == 0 for p in prompt_token_ids):
-        raise ValueError("rollout: every prompt must encode to ≥1 token")
+        raise ValueError("rollout: every prompt must encode to >= 1 token")
 
     input_ids, attention_mask, completion_mask, prompt_indices, prompt_lens = (
         sample_completions(
@@ -384,24 +328,20 @@ def rollout(
         )
     )
 
-    # Decode each row's completion portion and grade.
     completion_texts: list[str] = []
     rewards_list: list[float] = []
     N = input_ids.shape[0]
     for i in range(N):
         p_idx = int(prompt_indices[i].item())
         p_len = int(prompt_lens[i].item())
-        # Completion tokens live in [p_len, end], filtered by completion_mask
-        comp_slice_ids = input_ids[i, p_len:]
-        comp_slice_mask = completion_mask[i, p_len:]
-        valid = comp_slice_ids[comp_slice_mask.bool()].tolist()
-        # Strip the EOS token from the decoded text (still kept in input_ids
-        # / completion_mask for loss computation)
+        comp_ids = input_ids[i, p_len:]
+        comp_mask = completion_mask[i, p_len:]
+        valid = comp_ids[comp_mask.bool()].tolist()
+        # Drop the trailing EOS before decoding (it stays in input_ids /
+        # completion_mask for the loss).
         if valid and valid[-1] == tokenizer.eos_token_id:
-            valid_for_decode = valid[:-1]
-        else:
-            valid_for_decode = valid
-        text = tokenizer.decode(valid_for_decode)
+            valid = valid[:-1]
+        text = tokenizer.decode(valid)
         completion_texts.append(text)
         rewards_list.append(float(reward_fn(text, golds[p_idx], step=step)))
 

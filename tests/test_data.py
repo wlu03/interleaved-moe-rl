@@ -58,9 +58,7 @@ def _examples(n=10):
     ]
 
 
-# =====================================================================
-#  Prompt format
-# =====================================================================
+# Prompt format
 class TestFormatPrompt:
     def test_contains_system_user_assistant(self):
         p = format_prompt("2+2?")
@@ -70,16 +68,14 @@ class TestFormatPrompt:
         assert "\\boxed{}" in format_prompt("x")
 
 
-# =====================================================================
-#  Gold extraction
-# =====================================================================
+# Gold extraction
 class TestGoldExtraction:
     def test_gsm8k_gold_from_terminator(self):
         ans = "Some reasoning here.\n#### 42"
         assert gsm8k_gold(ans) == "42"
 
     def test_gsm8k_gold_fallback_to_raw(self):
-        # No #### and no "answer is" → returns stripped raw text
+        # No #### and no "answer is" -> returns stripped raw text
         assert gsm8k_gold("  72  ") == "72"
 
     def test_math_gold_from_boxed(self):
@@ -91,9 +87,7 @@ class TestGoldExtraction:
         assert math_gold(sol) == "2"
 
 
-# =====================================================================
-#  sample_batch provider
-# =====================================================================
+# sample_batch provider
 class TestSampleBatch:
     def test_returns_parallel_prompts_and_golds(self):
         sb = make_sample_batch(_examples(10), seed=0)
@@ -113,7 +107,7 @@ class TestSampleBatch:
 
     def test_wraps_around_pool(self):
         sb = make_sample_batch(_examples(4), seed=0)
-        prompts, golds = sb(6, 0)  # batch bigger than pool → wraps
+        prompts, golds = sb(6, 0)  # batch bigger than pool -> wraps
         assert len(prompts) == 6
 
     def test_empty_pool_raises(self):
@@ -121,9 +115,7 @@ class TestSampleBatch:
             make_sample_batch([], seed=0)
 
 
-# =====================================================================
-#  Probe builder
-# =====================================================================
+# Probe builder
 class TestProbe:
     def test_shape_and_padding(self, fake_tokenizer):
         probe = build_probe_input_ids(_examples(10), fake_tokenizer, n=5)
@@ -135,9 +127,7 @@ class TestProbe:
         assert probe.shape[0] == 3
 
 
-# =====================================================================
-#  Scoring
-# =====================================================================
+# Scoring
 class TestScoreCompletion:
     def test_boxed_correct(self):
         assert score_completion("the answer is \\boxed{42}", "42")
@@ -152,9 +142,7 @@ class TestScoreCompletion:
         assert score_completion("12", "12")
 
 
-# =====================================================================
-#  eval_fn against a stub model
-# =====================================================================
+# eval_fn against a stub model
 class TestEvalFn:
     def test_accuracy_reported_per_set(self, fake_tokenizer):
         torch.manual_seed(0)

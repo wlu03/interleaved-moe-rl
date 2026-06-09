@@ -20,9 +20,7 @@ from src.rl.rollout import (
 )
 
 
-# =====================================================================
-#  Test fixtures: tiny config + a fake tokenizer
-# =====================================================================
+# Test fixtures: tiny config + a fake tokenizer
 @pytest.fixture
 def tiny_config():
     return InterleavedMoEConfig(
@@ -78,9 +76,7 @@ def fake_tokenizer(tiny_config):
     return FakeTokenizer(vocab_size=tiny_config.vocab_size)
 
 
-# =====================================================================
-#  sample_next_token
-# =====================================================================
+# sample_next_token
 class TestSampleNextToken:
     def test_greedy_picks_argmax(self):
         logits = torch.tensor([[1.0, 2.0, 3.0, 0.5]])
@@ -108,9 +104,7 @@ class TestSampleNextToken:
         assert (out >= 0).all() and (out < 32).all()
 
 
-# =====================================================================
-#  sample_one_prompt
-# =====================================================================
+# sample_one_prompt
 class TestSampleOnePrompt:
     def test_shapes(self, tiny_model, fake_tokenizer):
         ids = fake_tokenizer.encode("hello")
@@ -234,9 +228,7 @@ class TestSampleOnePrompt:
         assert tiny_model.training
 
 
-# =====================================================================
-#  sample_completions
-# =====================================================================
+# sample_completions
 class TestSampleCompletions:
     def test_uniform_padding_across_prompts(self, tiny_model, fake_tokenizer):
         ids_a = fake_tokenizer.encode("a")
@@ -247,7 +239,7 @@ class TestSampleCompletions:
             pad_token_id=fake_tokenizer.pad_token_id,
             group_size=2, max_new_tokens=3, temperature=0.0,
         )
-        # Expected total rows = 2 prompts × 2 group = 4
+        # Expected total rows = 2 prompts x 2 group = 4
         assert seqs.shape[0] == 4
         # All rows share T_max
         assert seqs.shape == attns.shape == masks.shape
@@ -287,13 +279,11 @@ class TestSampleCompletions:
         assert p_idx.numel() == 0
 
 
-# =====================================================================
-#  group_advantages
-# =====================================================================
+# group_advantages
 class TestGroupAdvantages:
     def test_centers_per_group(self):
-        # Group 0: rewards [0, 1, 0, 1] → mean 0.5 → advantages [-0.5, 0.5, -0.5, 0.5]
-        # Group 1: rewards [1, 1, 1, 1] → mean 1.0 → advantages [0, 0, 0, 0]
+        # Group 0: rewards [0, 1, 0, 1] -> mean 0.5 -> advantages [-0.5, 0.5, -0.5, 0.5]
+        # Group 1: rewards [1, 1, 1, 1] -> mean 1.0 -> advantages [0, 0, 0, 0]
         rewards = torch.tensor([0.0, 1.0, 0.0, 1.0, 1.0, 1.0, 1.0, 1.0])
         adv = group_advantages(rewards, group_size=4, scale_rewards=False)
         assert adv[:4].tolist() == pytest.approx([-0.5, 0.5, -0.5, 0.5])
@@ -306,7 +296,7 @@ class TestGroupAdvantages:
         assert adv.std(unbiased=False).item() == pytest.approx(1.0, abs=1e-3)
 
     def test_degenerate_group_zero_advantage(self):
-        # All-equal rewards → after centering → all zeros
+        # All-equal rewards -> after centering -> all zeros
         rewards = torch.tensor([1.0, 1.0, 1.0, 1.0, 0.0, 0.0, 0.0, 0.0])
         adv_unscaled = group_advantages(rewards, group_size=4, scale_rewards=False)
         adv_scaled = group_advantages(rewards, group_size=4, scale_rewards=True)
@@ -328,9 +318,7 @@ class TestGroupAdvantages:
         assert out.numel() == 0
 
 
-# =====================================================================
-#  rollout (top-level API)
-# =====================================================================
+# rollout (top-level API)
 class TestRollout:
     def test_basic_shapes_and_types(self, tiny_model, fake_tokenizer):
         torch.manual_seed(0)
@@ -370,7 +358,7 @@ class TestRollout:
             group_size=2, max_new_tokens=2, temperature=0.0,
             reward_fn=reward_fn, step=42,
         )
-        # 2 prompts × 2 group = 4 reward calls
+        # 2 prompts x 2 group = 4 reward calls
         assert len(calls) == 4
         # First two calls should reference "X", next two "Y"
         assert calls[0][1] == "X" and calls[1][1] == "X"

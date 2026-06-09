@@ -1,20 +1,14 @@
-"""GRPO training loop — the final M3 slice.
+"""GRPO training loop.
 
-Wires together the rollout sampler (`rollout`), the GRPO step
-(`grpo_train_step`), and the instrumentation `Tracker`, with the periodic
-cadences from NEXT_STEPS.md §3:
+Ties together rollout, the GRPO step, and the instrumentation Tracker, running
+the periodic cadences (gradients every step, eval/drift/checkpoint on their own
+intervals).
 
-    - routing stats   every cfg.routing_every steps (Tracker owns the gate)
-    - gradient norms  every step
-    - eval            every cfg.eval_every steps
-    - drift (CKA/Proc) every cfg.drift_every steps vs. a stashed init snapshot
-    - checkpoint      every cfg.checkpoint_every steps, to ckpt_dir/latest.pt
-
-Configs are a Python registry (not YAML) so the loop is importable and
-testable on the local Python 3.9 venv where pyyaml / datasets aren't
-installed. Dataset and eval providers are injectable for the same reason —
-the loop logic is exercised by tests with tiny synthetic data, while Modal
-passes the real GSM8K + MATH mix.
+Configs are a Python registry rather than YAML so the loop imports cleanly on
+the local Py3.9 venv (no pyyaml/datasets there). For the same reason the
+tokenizer, data provider, and eval are injectable: tests drive the loop with a
+fake tokenizer and synthetic data, while Modal passes the real GSM8K+MATH
+providers.
 """
 
 from __future__ import annotations
@@ -32,53 +26,44 @@ from ..instrumentation.drift import collect_layer_activations
 from .grpo import GRPOConfig, grpo_train_step
 
 
-# ---- Loop config -------------------------------------------------------
 @dataclass
 class TrainConfig:
-    """Everything the loop needs: model arch, GRPO hyperparams, cadences."""
-
     name: str = "default"
     model: InterleavedMoEConfig = field(default_factory=InterleavedMoEConfig)
     grpo: GRPOConfig = field(default_factory=GRPOConfig)
 
-    # Optimizer
     lr: float = 1e-6
     weight_decay: float = 0.0
 
-    # Loop
     max_steps: int = 1000
-    batch_prompts: int = 8            # B prompts per step (each yields G rollouts)
+    batch_prompts: int = 8       # B prompts per step; each yields G rollouts
     seed: int = 0
 
-    # Cadences
     eval_every: int = 50
     drift_every: int = 100
     checkpoint_every: int = 200
     routing_every: int = 10
     grad_every: int = 1
 
-    # Probe set for drift
-    probe_size: int = 4096
+    probe_size: int = 4096       # drift probe set size
 
-    # W&B
     use_wandb: bool = False
     wandb_project: Optional[str] = None
 
 
-# ---- Config registry ---------------------------------------------------
 def _moe_config(**overrides) -> InterleavedMoEConfig:
     return replace(InterleavedMoEConfig(), **overrides)
 
 
 def _dense_config(**overrides) -> InterleavedMoEConfig:
-    # "Dense baseline": moe_every_n_layers <= 0 makes every layer dense.
+    # moe_every_n_layers <= 0 makes every layer dense.
     base = dict(moe_every_n_layers=0)
     base.update(overrides)
     return replace(InterleavedMoEConfig(), **base)
 
 
-# Named configs. Smoke variants are tiny so the pipeline runs on CPU in
-# seconds; full variants match the paper-scale experiment in NEXT_STEPS.md §5.
+# Named configs. The *_smoke variants are tiny enough to run on CPU in seconds;
+# the others are the paper-scale experiment.
 _REGISTRY: dict[str, Callable[[], TrainConfig]] = {
     "moe_interleaved": lambda: TrainConfig(
         name="moe_interleaved",
@@ -120,31 +105,26 @@ _REGISTRY: dict[str, Callable[[], TrainConfig]] = {
 
 def load_config(name: str) -> TrainConfig:
     if name not in _REGISTRY:
-        raise KeyError(
-            f"unknown config {name!r}; known: {sorted(_REGISTRY)}"
-        )
+        raise KeyError(f"unknown config {name!r}; known: {sorted(_REGISTRY)}")
     return _REGISTRY[name]()
 
 
 def register_config(name: str, factory: Callable[[], TrainConfig]) -> None:
-    """Register a custom config factory (used by tests / ablations)."""
     _REGISTRY[name] = factory
 
 
-# ---- Builders ----------------------------------------------------------
 def build_model(model_cfg: InterleavedMoEConfig) -> InterleavedMoEModel:
     return InterleavedMoEModel(model_cfg)
 
 
 def layer_kinds(model: InterleavedMoEModel) -> dict[int, str]:
-    """Map layer index → "moe" | "dense" for per-kind drift aggregation."""
+    """Map layer index -> "moe" | "dense" for per-kind drift aggregation."""
     return {
         i: ("moe" if getattr(layer, "is_moe", False) else "dense")
         for i, layer in enumerate(model.layers)
     }
 
 
-# ---- Checkpointing -----------------------------------------------------
 def save_checkpoint(
     model: torch.nn.Module,
     optimizer: torch.optim.Optimizer,
@@ -153,16 +133,13 @@ def save_checkpoint(
 ) -> None:
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
+    # Write to a temp file then rename so we never leave a half-written latest.pt.
     tmp = path.with_suffix(path.suffix + ".tmp")
     torch.save(
-        {
-            "step": step,
-            "model": model.state_dict(),
-            "optimizer": optimizer.state_dict(),
-        },
+        {"step": step, "model": model.state_dict(), "optimizer": optimizer.state_dict()},
         tmp,
     )
-    tmp.replace(path)  # atomic on POSIX — never leave a half-written latest.pt
+    tmp.replace(path)
 
 
 def load_checkpoint(
@@ -177,19 +154,12 @@ def load_checkpoint(
     return int(ckpt.get("step", 0))
 
 
-# ---- Default data / eval providers (overridable) -----------------------
 def _synthetic_data_provider(vocab_size: int):
-    """Tiny deterministic data so the loop is runnable without `datasets`.
-
-    Returns (sample_batch, probe_ids) where sample_batch(B, step) → (prompts,
-    golds) of decoded-ish strings, and probe_ids is a [n, S] int tensor for
-    drift snapshots.
-    """
+    """Deterministic toy data so the loop runs without `datasets` installed."""
     prompts = [f"problem {i}: 2 + {i} =" for i in range(64)]
     golds = [str(2 + i) for i in range(64)]
 
     def sample_batch(b: int, step: int):
-        # Deterministic rotating window, no RNG (keeps runs reproducible).
         start = (step * b) % len(prompts)
         idx = [(start + j) % len(prompts) for j in range(b)]
         return [prompts[i] for i in idx], [golds[i] for i in idx]
@@ -205,7 +175,6 @@ def collect_init_snapshot(
     return collect_layer_activations(model, probe_input_ids)
 
 
-# ---- Main loop ---------------------------------------------------------
 def main(
     config_name: str = "moe_interleaved",
     ckpt_dir: str | Path = "checkpoints",
@@ -220,13 +189,10 @@ def main(
     device: Optional[str] = None,
     max_steps: Optional[int] = None,
 ) -> dict:
-    """Run GRPO training.
+    """Run GRPO training and return a small summary dict.
 
-    Most arguments are injectable so the loop can be unit-tested with a fake
-    tokenizer and synthetic data. On Modal, only config_name / ckpt_dir /
-    resume are passed and the real GSM8K+MATH providers are wired here.
-
-    Returns a small summary dict (final step, last metrics).
+    Everything past `resume` is injectable for testing; on Modal only
+    config_name / ckpt_dir / resume (and the real providers) are passed.
     """
     cfg = load_config(config_name)
     if max_steps is not None:
@@ -246,19 +212,17 @@ def main(
     if tokenizer is None:
         tokenizer = _load_real_tokenizer(cfg.model.vocab_size)
 
-    # Data provider: real on Modal, synthetic fallback locally.
     if sample_batch is None:
         sample_batch, _prompts, _golds = _synthetic_data_provider(cfg.model.vocab_size)
 
-    # Probe set for drift: encode a held-out batch of prompts.
+    # Build a probe batch for drift if one wasn't supplied.
     if probe_input_ids is None:
         probe_prompts, _ = sample_batch(min(cfg.probe_size, 32), 0)
         probe_ids = [tokenizer.encode(p) for p in probe_prompts]
         max_len = max(len(p) for p in probe_ids)
         pad = tokenizer.pad_token_id
         probe_input_ids = torch.tensor(
-            [p + [pad] * (max_len - len(p)) for p in probe_ids],
-            dtype=torch.long,
+            [p + [pad] * (max_len - len(p)) for p in probe_ids], dtype=torch.long
         )
     probe_input_ids = probe_input_ids.to(dev)
 
@@ -309,8 +273,7 @@ def main(
                 tracker.log_gradients(step, model)
 
             if step % cfg.eval_every == 0 and eval_fn is not None:
-                eval_metrics = eval_fn(model, tokenizer, step)
-                tracker.log_step(step, **eval_metrics)
+                tracker.log_step(step, **eval_fn(model, tokenizer, step))
 
             if step % cfg.drift_every == 0 and step > start_step:
                 cur_acts = collect_layer_activations(model, probe_input_ids)
@@ -332,23 +295,20 @@ def main(
 
 
 def smoke_train_loop(config_name: str = "moe_interleaved_smoke", steps: int = 50) -> dict:
-    """Entry point used by modal/modal_app.py::smoke_train.
+    """Run the full pipeline for a few steps on synthetic data.
 
-    Runs the full pipeline (rollout → loss → step → instrumentation →
-    checkpoint) for a handful of steps on the synthetic provider, verifying
-    the wiring end-to-end before paying for a real GPU run.
+    Used by modal/modal_app.py::smoke_train to verify the wiring before paying
+    for a real GPU run.
     """
     return main(config_name=config_name, ckpt_dir="checkpoints", resume=False,
                 max_steps=steps)
 
 
-# ---- Real tokenizer (Modal-only; lazy import) --------------------------
 def _load_real_tokenizer(vocab_size: int):
-    """Load the Qwen2.5-Math tokenizer on Modal. Falls back to a byte-level
-    stub locally (where `transformers` may be absent) so imports never fail.
-    """
+    """Qwen2.5-Math tokenizer on Modal, with a byte-level fallback locally where
+    `transformers` may not be installed."""
     try:
-        from transformers import AutoTokenizer  # type: ignore
+        from transformers import AutoTokenizer
 
         tok = AutoTokenizer.from_pretrained("Qwen/Qwen2.5-Math-1.5B")
         if tok.pad_token_id is None:

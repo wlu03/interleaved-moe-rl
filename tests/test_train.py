@@ -22,9 +22,7 @@ from src.rl.train import (
 )
 
 
-# =====================================================================
-#  Fixtures
-# =====================================================================
+# Fixtures
 class FakeTokenizer:
     def __init__(self, vocab_size: int = 64):
         self.vocab_size = vocab_size
@@ -75,9 +73,7 @@ def fake_sample_batch(b, step):
     return prompts, golds
 
 
-# =====================================================================
-#  Config registry
-# =====================================================================
+# Config registry
 class TestConfigRegistry:
     def test_known_configs_load(self):
         for name in [
@@ -106,9 +102,7 @@ class TestConfigRegistry:
         assert "dense" in kinds.values()
 
 
-# =====================================================================
-#  Checkpointing
-# =====================================================================
+# Checkpointing
 class TestCheckpoint:
     def test_round_trip(self, tmp_path):
         cfg = _tiny_train_config()
@@ -137,9 +131,7 @@ class TestCheckpoint:
         assert not (tmp_path / "latest.pt.tmp").exists()
 
 
-# =====================================================================
-#  Loop
-# =====================================================================
+# Loop
 class TestMainLoop:
     def test_runs_and_returns_summary(self, tmp_path, fake_tokenizer):
         summary = main(
@@ -179,7 +171,7 @@ class TestMainLoop:
             tokenizer=fake_tokenizer, sample_batch=fake_sample_batch,
             eval_fn=eval_fn, device="cpu",
         )
-        # eval_every=2, max_steps=4 → steps 0 and 2
+        # eval_every=2, max_steps=4 -> steps 0 and 2
         assert 0 in calls and 2 in calls
 
     def test_resume_from_checkpoint(self, tmp_path, fake_tokenizer):

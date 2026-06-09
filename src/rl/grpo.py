@@ -1,18 +1,14 @@
 """GRPO loss and training step.
 
-The loss never touches strings — it consumes a `RolloutBatch` (token ids,
-masks, and precomputed group advantages) and produces a scalar to backprop.
+The loss never sees strings: it works off a RolloutBatch (token ids, masks,
+precomputed group advantages) and returns a scalar to backprop.
 
-Design choices (locked in NEXT_STEPS.md):
-    - Dr.GRPO normalization: divide the summed per-token loss by a constant
-      (num_rollouts * max_completion_len), NOT per-sequence length. This
-      removes the length bias that per-sequence averaging introduces.
-    - beta = 0: no KL term, no reference model. DAPO / Open-Reasoner-Zero /
-      Dr.GRPO all drop it. Saves a forward pass and ~15% memory.
-    - Clipped surrogate with DAPO clip-higher (eps_low < eps_high). With
-      num_inner_epochs = 1 the ratio is identically 1 at the gradient step
-      (old_logprobs == new_logprobs), so clipping is inert — but it is
-      implemented faithfully so multi-epoch upgrades are a config change.
+Defaults follow Dr.GRPO with no KL term (beta=0, so no reference model). The
+loss is normalized by a constant (N * max_completion_len) rather than per
+sequence, which avoids the length bias that per-sequence averaging causes.
+Clipping uses DAPO's clip-higher (eps_low < eps_high). With num_inner_epochs=1
+the ratio is exactly 1 at the gradient step, so the clip never bites -- but
+it's implemented properly so going multi-epoch is just a config change.
 """
 
 from __future__ import annotations
@@ -26,73 +22,47 @@ import torch.nn.functional as F
 from .rollout import RolloutBatch, rollout as default_rollout
 
 
-# ---- Config ------------------------------------------------------------
 @dataclass
 class GRPOConfig:
-    """GRPO hyperparameters (Dr.GRPO defaults, beta=0)."""
-
-    group_size: int = 8           # rollouts per prompt
-    eps_low: float = 0.2          # PPO clip lower bound
-    eps_high: float = 0.28        # DAPO clip-higher upper bound
-    beta: float = 0.0             # KL coefficient; 0 = no reference model
-    loss_type: str = "dr_grpo"    # "dr_grpo" | "grpo" (per-sequence mean)
-    max_completion_len: int = 512  # normalizer constant for dr_grpo
+    group_size: int = 8
+    eps_low: float = 0.2
+    eps_high: float = 0.28          # DAPO clip-higher
+    beta: float = 0.0               # KL coef; 0 => no reference model
+    loss_type: str = "dr_grpo"      # "dr_grpo" | "grpo"
+    max_completion_len: int = 512   # normalizer for dr_grpo
     temperature: float = 1.0
     top_p: float = 1.0
-    scale_rewards: bool = False   # std-normalize advantages within group
-    num_inner_epochs: int = 1     # mu; 1 = pure on-policy, ratio == 1
-    grad_clip: float = 1.0        # global grad-norm clip (0 disables)
+    scale_rewards: bool = False
+    num_inner_epochs: int = 1       # mu; 1 => pure on-policy, ratio == 1
+    grad_clip: float = 1.0          # 0 disables
 
 
-# ---- Log-prob helpers --------------------------------------------------
 def selective_log_softmax(logits: torch.Tensor, index: torch.Tensor) -> torch.Tensor:
-    """Per-token log-probability of the chosen `index`, without materializing
-    the full [*, V] log-softmax for every row at once.
+    """log p(index) under softmax(logits), gathered per position.
 
-    Args:
-        logits: [..., V]
-        index:  [...]  token id to select at each position
-
-    Returns:
-        [...] log p(index) under softmax(logits)
+    logits is [..., V], index is [...]; returns [...].
     """
     logps = F.log_softmax(logits, dim=-1)
     return logps.gather(dim=-1, index=index.unsqueeze(-1)).squeeze(-1)
 
 
-def compute_logprobs(
-    model: torch.nn.Module,
-    input_ids: torch.Tensor,
-) -> torch.Tensor:
-    """Per-token log-probs aligned to the *target* tokens.
+def compute_logprobs(model: torch.nn.Module, input_ids: torch.Tensor) -> torch.Tensor:
+    """Per-token log-probs aligned to the target tokens.
 
-    For an autoregressive model, the log-prob of the token at position t is
-    read from the logits at position t-1. We therefore return a tensor of
-    shape [N, T-1] where column j holds log p(input_ids[:, j+1]).
-
-    Args:
-        model: returns dict with "logits" [N, T, V]
-        input_ids: [N, T]
-
-    Returns:
-        [N, T-1] per-token log-probs
+    The model predicts token t from the logits at position t-1, so we drop the
+    last logit and the first input id. Result is [N, T-1] where column j holds
+    log p(input_ids[:, j+1]).
     """
-    logits = model(input_ids)["logits"]          # [N, T, V]
-    logits = logits[:, :-1, :]                    # predict tokens 1..T-1
-    targets = input_ids[:, 1:]                    # [N, T-1]
+    logits = model(input_ids)["logits"][:, :-1, :]
+    targets = input_ids[:, 1:]
     return selective_log_softmax(logits, targets)
 
 
 def shift_completion_mask(completion_mask: torch.Tensor) -> torch.Tensor:
-    """Align a completion mask [N, T] to the target positions [N, T-1].
-
-    Column j of the shifted mask corresponds to predicting input_ids[:, j+1],
-    so it takes its value from completion_mask[:, j+1].
-    """
+    """Align a [N, T] completion mask to the [N, T-1] target positions."""
     return completion_mask[:, 1:].to(torch.float32)
 
 
-# ---- Loss --------------------------------------------------------------
 def grpo_loss(
     logprobs: torch.Tensor,
     old_logprobs: torch.Tensor,
@@ -100,35 +70,25 @@ def grpo_loss(
     completion_mask: torch.Tensor,
     cfg: GRPOConfig,
 ) -> tuple[torch.Tensor, dict]:
-    """Clipped GRPO surrogate loss over completion tokens.
+    """Clipped GRPO surrogate over completion tokens.
 
-    Args:
-        logprobs:     [N, T-1] current-policy per-token log-probs (grad)
-        old_logprobs: [N, T-1] sampling-policy log-probs (no grad). With
-                      num_inner_epochs=1 these equal `logprobs` numerically.
-        advantages:   [N] per-rollout group advantage (broadcast over tokens)
-        completion_mask: [N, T-1] 1 on generated-token target positions
-        cfg: GRPOConfig
-
-    Returns:
-        (loss scalar, metrics dict)
+    logprobs/old_logprobs are [N, T-1]; advantages [N] broadcast over tokens;
+    completion_mask [N, T-1]. Returns (loss, metrics).
     """
     mask = completion_mask.to(logprobs.dtype)
-    adv = advantages.to(logprobs.dtype).unsqueeze(-1)  # [N, 1]
+    adv = advantages.to(logprobs.dtype).unsqueeze(-1)
 
-    ratio = torch.exp(logprobs - old_logprobs)         # [N, T-1]
+    ratio = torch.exp(logprobs - old_logprobs)
     unclipped = ratio * adv
     clipped = torch.clamp(ratio, 1.0 - cfg.eps_low, 1.0 + cfg.eps_high) * adv
-    per_token = -torch.min(unclipped, clipped)         # [N, T-1]
-
-    per_token = per_token * mask
+    per_token = -torch.min(unclipped, clipped) * mask
 
     if cfg.loss_type == "dr_grpo":
-        # Constant normalizer → no length bias. N rollouts * max len.
+        # Constant normalizer -> no length bias.
         normalizer = logprobs.shape[0] * cfg.max_completion_len
         loss = per_token.sum() / normalizer
     elif cfg.loss_type == "grpo":
-        # Per-sequence mean over its own completion tokens, then mean over rows.
+        # Per-sequence mean over its own tokens, then mean across rows.
         tok_per_row = mask.sum(dim=-1).clamp_min(1.0)
         loss = (per_token.sum(dim=-1) / tok_per_row).mean()
     else:
@@ -148,7 +108,6 @@ def grpo_loss(
     return loss, metrics
 
 
-# ---- Train step --------------------------------------------------------
 def grpo_train_step(
     model: torch.nn.Module,
     tokenizer,
@@ -162,21 +121,10 @@ def grpo_train_step(
     rollout_fn: Optional[Callable[..., RolloutBatch]] = None,
     tracker=None,
 ) -> dict:
-    """One GRPO update: rollout → loss → backward → step.
+    """One GRPO update: rollout -> loss -> backward -> step.
 
-    Args:
-        model: policy (InterleavedMoEModel or compatible).
-        tokenizer: exposes encode/decode/eos_token_id/pad_token_id.
-        optimizer: already constructed over model.parameters().
-        prompts, golds: parallel lists, B each.
-        cfg: GRPOConfig.
-        step: global step (governs the reward format-bonus phase).
-        reward_fn: override the default math reward.
-        rollout_fn: override the sampler (tests inject a fake batch).
-        tracker: optional object with .log_routing(step, routing_stats).
-
-    Returns:
-        metrics dict including mean_reward and loss.
+    `rollout_fn` and `reward_fn` are injectable so tests can hand in a fixed
+    batch. Returns a metrics dict including mean_reward and loss.
     """
     if rollout_fn is None:
         rollout_fn = default_rollout
@@ -201,10 +149,10 @@ def grpo_train_step(
     device = next(model.parameters()).device
     batch = batch.to(device)
 
-    completion_mask = shift_completion_mask(batch.completion_mask)  # [N, T-1]
+    completion_mask = shift_completion_mask(batch.completion_mask)
 
-    # Sampling-policy log-probs (no grad). num_inner_epochs=1 → equal to the
-    # first inner step's logprobs, so the ratio is 1 and clipping is inert.
+    # Sampling-policy log-probs. With num_inner_epochs=1 these equal the first
+    # inner step's logprobs, so ratio == 1 and the clip is inert.
     with torch.no_grad():
         old_logprobs = compute_logprobs(model, batch.input_ids)
 
@@ -233,5 +181,4 @@ def grpo_train_step(
 
     last_metrics["mean_reward"] = float(batch.rewards.mean())
     last_metrics["reward_std"] = float(batch.rewards.std(unbiased=False))
-
     return last_metrics

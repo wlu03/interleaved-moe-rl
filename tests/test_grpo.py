@@ -21,9 +21,7 @@ from src.rl.grpo import (
 from src.rl.rollout import RolloutBatch
 
 
-# =====================================================================
-#  Fixtures
-# =====================================================================
+# Fixtures
 @pytest.fixture
 def tiny_config():
     return InterleavedMoEConfig(
@@ -102,9 +100,7 @@ def make_batch(n_prompts, group_size, prompt_len, comp_len, vocab=64, rewards=No
     )
 
 
-# =====================================================================
-#  selective_log_softmax
-# =====================================================================
+# selective_log_softmax
 class TestSelectiveLogSoftmax:
     def test_matches_full_log_softmax(self):
         torch.manual_seed(0)
@@ -122,9 +118,7 @@ class TestSelectiveLogSoftmax:
         assert selective_log_softmax(logits, index).shape == (2, 4)
 
 
-# =====================================================================
-#  compute_logprobs
-# =====================================================================
+# compute_logprobs
 class TestComputeLogprobs:
     def test_shape_is_T_minus_1(self, tiny_model):
         input_ids = torch.randint(2, 64, (4, 10))
@@ -145,9 +139,7 @@ class TestComputeLogprobs:
         assert torch.allclose(got, expected, atol=1e-5)
 
 
-# =====================================================================
-#  shift_completion_mask
-# =====================================================================
+# shift_completion_mask
 class TestShiftCompletionMask:
     def test_drops_first_column(self):
         cm = torch.tensor([[0, 0, 1, 1, 1]])
@@ -156,12 +148,10 @@ class TestShiftCompletionMask:
         assert torch.equal(shifted, torch.tensor([[0.0, 1.0, 1.0, 1.0]]))
 
 
-# =====================================================================
-#  grpo_loss
-# =====================================================================
+# grpo_loss
 class TestGrpoLoss:
     def test_ratio_one_when_logprobs_equal(self):
-        # old == new → ratio == 1 → loss == -(adv) summed over comp tokens / norm
+        # old == new -> ratio == 1 -> loss == -(adv) summed over comp tokens / norm
         lp = torch.tensor([[-1.0, -2.0, -0.5]])
         adv = torch.tensor([2.0])
         mask = torch.ones(1, 3)
@@ -210,18 +200,18 @@ class TestGrpoLoss:
         )
         cfg = GRPOConfig(loss_type="grpo")
         loss, _ = grpo_loss(lp, lp.clone(), adv, mask, cfg)
-        # row means: -1 and -1 → mean -1 (length-normalized)
+        # row means: -1 and -1 -> mean -1 (length-normalized)
         assert torch.allclose(loss, torch.tensor(-1.0))
 
     def test_clip_higher_caps_positive_advantage(self):
-        # ratio large, positive advantage → clipped at 1+eps_high
+        # ratio large, positive advantage -> clipped at 1+eps_high
         old = torch.tensor([[0.0]])
-        new = torch.tensor([[2.0]])  # ratio = e^2 ≈ 7.39
+        new = torch.tensor([[2.0]])  # ratio = e^2 ~= 7.39
         adv = torch.tensor([1.0])
         mask = torch.ones(1, 1)
         cfg = GRPOConfig(max_completion_len=1, eps_high=0.28)
         loss, m = grpo_loss(new, old, adv, mask, cfg)
-        # min(7.39*1, 1.28*1) = 1.28 → loss = -1.28 / 1
+        # min(7.39*1, 1.28*1) = 1.28 -> loss = -1.28 / 1
         assert torch.allclose(loss, torch.tensor(-1.28), atol=1e-4)
         assert m["clip_frac"] == 1.0
 
@@ -232,9 +222,7 @@ class TestGrpoLoss:
             grpo_loss(lp, lp, torch.zeros(1), torch.ones(1, 2), cfg)
 
 
-# =====================================================================
-#  grpo_train_step
-# =====================================================================
+# grpo_train_step
 class TestGrpoTrainStep:
     def test_step_runs_and_updates_params(self, tiny_model, fake_tokenizer):
         cfg = GRPOConfig(group_size=2, max_completion_len=4)

@@ -1,13 +1,12 @@
-"""Dataset + eval providers for the GRPO loop.
+"""Dataset and eval providers for the GRPO loop.
 
-The training loop (`train.main`) takes `sample_batch` and `eval_fn` as
-injectable callables. This module builds the *real* ones backed by GSM8K +
-MATH (HuggingFace `datasets`), matching the recipe in NEXT_STEPS.md §3.
+train.main takes `sample_batch` and `eval_fn` as injectable callables; this
+module builds the real ones backed by GSM8K + MATH.
 
-`datasets` is only installed on Modal (the local Py3.9 venv lacks it), so the
-heavy loaders import it lazily inside the functions. Everything that does NOT
-need `datasets` — prompt formatting, gold extraction, batch assembly,
-accuracy scoring — is pure and unit-tested locally.
+`datasets` only exists on Modal (not the local Py3.9 venv), so the heavy
+loaders import it lazily inside the functions. Everything that doesn't touch
+it -- prompt formatting, gold extraction, batching, scoring -- is pure and
+unit-tested locally.
 """
 
 from __future__ import annotations
@@ -20,43 +19,32 @@ import torch
 from .rewards import answers_equivalent, extract_boxed_answer, extract_gsm8k_answer
 
 
-# ---- Prompt format (NEXT_STEPS.md §3) ----------------------------------
-SYSTEM_PROMPT = (
-    "Solve the problem step by step. Put your final answer in \\boxed{}."
-)
+SYSTEM_PROMPT = "Solve the problem step by step. Put your final answer in \\boxed{}."
 
 
 def format_prompt(problem: str) -> str:
-    """Render a single problem into the train/eval prompt string."""
-    return (
-        f"System: {SYSTEM_PROMPT}\n"
-        f"User: {problem}\n"
-        f"Assistant:"
-    )
+    return f"System: {SYSTEM_PROMPT}\nUser: {problem}\nAssistant:"
 
 
-# ---- Example container -------------------------------------------------
 @dataclass(frozen=True)
 class Example:
-    prompt: str          # fully formatted, ready to tokenize
-    gold: str            # ground-truth answer string
-    source: str          # "gsm8k" | "math" | eval set name
+    prompt: str   # fully formatted, ready to tokenize
+    gold: str     # ground-truth answer
+    source: str   # "gsm8k" | "math" | eval set name
 
 
-# ---- Gold extraction per source ----------------------------------------
 def gsm8k_gold(answer_field: str) -> str:
-    """GSM8K answers end with `#### N`. Return the numeric token."""
+    """GSM8K answers end with `#### N`; return the numeric token."""
     extracted = extract_gsm8k_answer(answer_field)
     return extracted if extracted is not None else answer_field.strip()
 
 
 def math_gold(solution_field: str) -> str:
-    """MATH solutions embed the answer in the LAST `\\boxed{}`."""
+    """MATH solutions put the answer in the last `\\boxed{}`."""
     boxed = extract_boxed_answer(solution_field)
     return boxed if boxed is not None else solution_field.strip()
 
 
-# ---- Dataset loaders (lazy `datasets`) ---------------------------------
 def load_gsm8k_train() -> list[Example]:
     from datasets import load_dataset
 
@@ -88,12 +76,12 @@ def load_math_l13_train() -> list[Example]:
 
 
 def load_train_mix() -> list[Example]:
-    """GSM8K + MATH L1–L3, the training mix from NEXT_STEPS.md §3."""
+    """GSM8K + MATH L1-L3, the training mix."""
     return load_gsm8k_train() + load_math_l13_train()
 
 
 def load_eval_set(name: str) -> list[Example]:
-    """Load a held-out eval set. `name` ∈ {"math500", "aime2024"}."""
+    """Load a held-out eval set: "math500" or "aime2024"."""
     from datasets import load_dataset
 
     if name == "math500":
@@ -111,16 +99,15 @@ def load_eval_set(name: str) -> list[Example]:
     raise ValueError(f"unknown eval set: {name!r}")
 
 
-# ---- Batch provider ----------------------------------------------------
 def make_sample_batch(
     examples: Sequence[Example],
     seed: int = 0,
 ) -> Callable[[int, int], tuple[list[str], list[str]]]:
     """Build a `sample_batch(b, step)` over a fixed example pool.
 
-    Uses a seeded, deterministic permutation walked in order (NOT random per
-    call) so a resumed run at the same step sees the same prompts — essential
-    for the paired-run reproducibility requirement in NEXT_STEPS.md §5.
+    The pool is permuted once (seeded) and then walked in order, so a resumed
+    run sees the same prompts at the same step. That determinism is what lets
+    the paired dense/MoE runs share an identical data order.
     """
     n = len(examples)
     if n == 0:
@@ -132,9 +119,10 @@ def make_sample_batch(
     def sample_batch(b: int, step: int) -> tuple[list[str], list[str]]:
         start = (step * b) % n
         idx = [order[(start + j) % n] for j in range(b)]
-        prompts = [examples[i].prompt for i in idx]
-        golds = [examples[i].gold for i in idx]
-        return prompts, golds
+        return (
+            [examples[i].prompt for i in idx],
+            [examples[i].gold for i in idx],
+        )
 
     return sample_batch
 
@@ -145,8 +133,8 @@ def build_probe_input_ids(
     n: int,
     seed: int = 0,
 ) -> torch.Tensor:
-    """Encode `n` held-out prompts into a right-padded [n, S] probe tensor for
-    drift snapshots (NEXT_STEPS.md §2 — probe set ≥ 2× hidden_dim)."""
+    """Encode n held-out prompts into a right-padded [n, S] probe tensor for
+    the drift snapshots."""
     n = min(n, len(examples))
     g = torch.Generator().manual_seed(seed)
     idx = torch.randperm(len(examples), generator=g)[:n].tolist()
@@ -158,12 +146,11 @@ def build_probe_input_ids(
     )
 
 
-# ---- Eval ---------------------------------------------------------------
 def score_completion(completion: str, gold: str) -> bool:
-    """A completion is correct iff its extracted answer matches gold.
+    """True iff the completion's extracted answer matches gold.
 
-    Prefers `\\boxed{}` (the format we train toward); falls back to the GSM8K
-    `#### N` extractor; finally compares the raw text.
+    Prefer `\\boxed{}` (what we train toward), then the GSM8K `#### N`
+    extractor, then the raw text.
     """
     pred = extract_boxed_answer(completion)
     if pred is None:
@@ -182,8 +169,8 @@ def make_eval_fn(
 ) -> Callable[..., dict]:
     """Build `eval_fn(model, tokenizer, step) -> {metric: value}`.
 
-    Greedy-decodes each eval prompt once and reports accuracy per set. Runs
-    under no_grad in eval mode; restores training mode afterward.
+    Greedy-decodes each eval prompt once and reports per-set accuracy. Runs in
+    eval/no_grad and restores training mode afterward.
     """
     from .rollout import sample_one_prompt
 
@@ -214,8 +201,7 @@ def make_eval_fn(
                     valid = comp_ids[comp_mask].tolist()
                     if valid and valid[-1] == tokenizer.eos_token_id:
                         valid = valid[:-1]
-                    text = tokenizer.decode(valid)
-                    if score_completion(text, ex.gold):
+                    if score_completion(tokenizer.decode(valid), ex.gold):
                         correct += 1
                 out[f"eval/{set_name}/acc"] = correct / len(pool)
         finally:
