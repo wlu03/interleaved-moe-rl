@@ -33,6 +33,13 @@ class Example:
     source: str   # "gsm8k" | "math" | eval set name
 
 
+@dataclass(frozen=True)
+class SFTExample:
+    prompt: str       # same formatted prompt as RL
+    completion: str   # full reference solution, ending in \boxed{answer}
+    source: str
+
+
 def gsm8k_gold(answer_field: str) -> str:
     """GSM8K answers end with `#### N`; return the numeric token."""
     extracted = extract_gsm8k_answer(answer_field)
@@ -97,6 +104,114 @@ def load_eval_set(name: str) -> list[Example]:
             for r in ds
         ]
     raise ValueError(f"unknown eval set: {name!r}")
+
+
+def _gsm8k_completion(answer_field: str) -> str:
+    """Turn a GSM8K answer into a reference completion ending in \\boxed{}.
+
+    The dataset answer is the chain of thought followed by `#### N`. We keep the
+    reasoning, drop the `####` line, and append a boxed final answer so the
+    target matches the format the RL reward looks for.
+    """
+    final = gsm8k_gold(answer_field)
+    body = answer_field.split("####")[0].strip()
+    eos_marker = " "
+    return f"{body}{eos_marker}The final answer is \\boxed{{{final}}}."
+
+
+def load_gsm8k_sft() -> list[SFTExample]:
+    from datasets import load_dataset
+
+    ds = load_dataset("openai/gsm8k", "main", split="train")
+    return [
+        SFTExample(
+            format_prompt(row["question"]),
+            _gsm8k_completion(row["answer"]),
+            "gsm8k",
+        )
+        for row in ds
+    ]
+
+
+def load_math_l13_sft() -> list[SFTExample]:
+    from datasets import concatenate_datasets, load_dataset
+
+    parts = [
+        load_dataset("EleutherAI/hendrycks_math", c, split="train").filter(
+            lambda x: x["level"] in _MATH_LEVELS
+        )
+        for c in _MATH_CONFIGS
+    ]
+    ds = concatenate_datasets(parts)
+    # MATH solutions already contain a \boxed{} answer, so the raw solution is a
+    # well-formatted completion as-is.
+    return [
+        SFTExample(format_prompt(row["problem"]), row["solution"].strip(), "math")
+        for row in ds
+    ]
+
+
+def load_sft_mix() -> list[SFTExample]:
+    """GSM8K + MATH L1-L3 reference solutions for the SFT warm-start."""
+    return load_gsm8k_sft() + load_math_l13_sft()
+
+
+def encode_sft_example(
+    ex: SFTExample,
+    tokenizer,
+    max_len: int = 1024,
+) -> tuple[list[int], list[int]]:
+    """Tokenize one SFT example into (input_ids, labels).
+
+    Labels mask the prompt with -100 so the loss only supervises completion
+    tokens, and append EOS so the model learns to stop.
+
+    When the pair is longer than max_len we trim the *prompt* from the left
+    rather than the completion from the right -- truncating the completion
+    would leave a row with no supervised tokens (all -100), which makes the
+    cross-entropy NaN. Only if the completion alone exceeds max_len do we trim
+    it too.
+    """
+    prompt_ids = tokenizer.encode(ex.prompt)
+    completion_ids = tokenizer.encode(ex.completion) + [tokenizer.eos_token_id]
+
+    if len(completion_ids) >= max_len:
+        # Pathological: keep the tail of the completion (the boxed answer), drop
+        # the prompt entirely.
+        completion_ids = completion_ids[-max_len:]
+        prompt_ids = []
+    else:
+        budget = max_len - len(completion_ids)
+        prompt_ids = prompt_ids[-budget:]
+
+    input_ids = prompt_ids + completion_ids
+    labels = [-100] * len(prompt_ids) + completion_ids
+    return input_ids, labels
+
+
+def collate_sft_batch(
+    examples: Sequence[SFTExample],
+    tokenizer,
+    max_len: int = 1024,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Encode and right-pad a batch of SFT examples into (input_ids, labels).
+
+    Padded positions get pad_token_id in input_ids and -100 in labels so they
+    don't contribute to the loss.
+    """
+    encoded = [encode_sft_example(ex, tokenizer, max_len) for ex in examples]
+    batch_len = max(len(ids) for ids, _ in encoded)
+    pad = tokenizer.pad_token_id
+
+    input_rows, label_rows = [], []
+    for ids, labels in encoded:
+        gap = batch_len - len(ids)
+        input_rows.append(ids + [pad] * gap)
+        label_rows.append(labels + [-100] * gap)
+    return (
+        torch.tensor(input_rows, dtype=torch.long),
+        torch.tensor(label_rows, dtype=torch.long),
+    )
 
 
 def make_sample_batch(

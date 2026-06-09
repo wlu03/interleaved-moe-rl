@@ -188,11 +188,16 @@ def main(
     tracker: Optional[Tracker] = None,
     device: Optional[str] = None,
     max_steps: Optional[int] = None,
+    init_from: Optional[str | Path] = None,
 ) -> dict:
     """Run GRPO training and return a small summary dict.
 
     Everything past `resume` is injectable for testing; on Modal only
     config_name / ckpt_dir / resume (and the real providers) are passed.
+
+    `init_from` points at an SFT checkpoint whose model weights seed the policy
+    (fresh optimizer) -- this is the `sft_then_rl` warm-start. It's ignored when
+    resuming from an existing RL checkpoint, which already reflects it.
     """
     cfg = load_config(config_name)
     if max_steps is not None:
@@ -240,13 +245,22 @@ def main(
         )
     tracker.start()
 
-    kinds = layer_kinds(model)
-    init_acts = collect_init_snapshot(model, probe_input_ids)
-
     ckpt_dir = Path(ckpt_dir) / cfg.name
     latest = ckpt_dir / "latest.pt"
     start_step = 0
-    if resume and latest.exists():
+    resuming = resume and latest.exists()
+
+    # Warm-start from SFT weights before snapshotting, so drift is measured
+    # relative to the SFT init -- but only on a fresh run, since an existing RL
+    # checkpoint already carries the warm-started weights.
+    if init_from is not None and not resuming:
+        load_checkpoint(model, None, Path(init_from))
+        print(f"[train] initialized policy from SFT checkpoint {init_from}")
+
+    kinds = layer_kinds(model)
+    init_acts = collect_init_snapshot(model, probe_input_ids)
+
+    if resuming:
         start_step = load_checkpoint(model, optimizer, latest)
         print(f"[train] resumed from {latest} at step {start_step}")
 

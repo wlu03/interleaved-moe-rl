@@ -37,16 +37,25 @@ from .train import (
 )
 from .data import (
     Example,
+    SFTExample,
     SYSTEM_PROMPT,
     format_prompt,
     gsm8k_gold,
     math_gold,
     load_train_mix,
     load_eval_set,
+    load_sft_mix,
+    encode_sft_example,
+    collate_sft_batch,
     make_sample_batch,
     build_probe_input_ids,
     score_completion,
     make_eval_fn,
+)
+from .sft import (
+    SFTConfig,
+    sft_config_for,
+    train_sft,
 )
 
 __all__ = [
@@ -78,14 +87,21 @@ __all__ = [
     "main",
     "smoke_train_loop",
     "Example",
+    "SFTExample",
     "SYSTEM_PROMPT",
     "format_prompt",
     "gsm8k_gold",
     "math_gold",
     "load_train_mix",
     "load_eval_set",
+    "load_sft_mix",
+    "encode_sft_example",
+    "collate_sft_batch",
     "make_sample_batch",
     "build_probe_input_ids",
     "score_completion",
     "make_eval_fn",
+    "SFTConfig",
+    "sft_config_for",
+    "train_sft",
 ]

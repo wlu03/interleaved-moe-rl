@@ -164,6 +164,55 @@ def _build_providers(config_name: str, eval_cap=None):
 
 
 # =====================================================================
+#  SFT warm-start: produces the init checkpoint for the sft_then_rl arm.
+# =====================================================================
+@app.function(
+    gpu="H100",
+    timeout=24 * 60 * 60,
+    volumes={
+        "/checkpoints": checkpoints,
+        "/cache/hf": hf_cache,
+    },
+    secrets=[
+        modal.Secret.from_name("wandb-secret", required_keys=[]),
+        modal.Secret.from_name("huggingface-secret", required_keys=[]),
+    ],
+    retries=modal.Retries(initial_delay=0, max_retries=10),
+)
+def sft(config_name: str = "moe_interleaved", steps: int = 500):
+    """Supervised fine-tune the arch behind `config_name` on GSM8K+MATH
+    solutions. Writes /checkpoints/<config_name>_sft/latest.pt."""
+    import os
+    os.environ["HF_HOME"] = "/cache/hf"
+
+    from src.rl.sft import sft_config_for, train_sft
+    from src.rl.train import _load_real_tokenizer
+    from src.rl.data import load_sft_mix, collate_sft_batch
+
+    cfg = sft_config_for(config_name, max_steps=steps)
+    tokenizer = _load_real_tokenizer(cfg.model.vocab_size)
+
+    print("[sft] loading GSM8K + MATH L1-L3 solutions ...")
+    examples = load_sft_mix()
+    print(f"[sft] {len(examples)} SFT examples")
+
+    import torch
+    g = torch.Generator().manual_seed(cfg.seed)
+    order = torch.randperm(len(examples), generator=g).tolist()
+
+    def next_batch(tok, batch_size, step, max_len):
+        start = (step * batch_size) % len(examples)
+        chunk = [examples[order[(start + j) % len(examples)]] for j in range(batch_size)]
+        return collate_sft_batch(chunk, tok, max_len=max_len)
+
+    summary = train_sft(cfg, ckpt_dir="/checkpoints", tokenizer=tokenizer,
+                        next_batch=next_batch)
+    checkpoints.commit()
+    print(f"[sft] done: {summary}")
+    return {"status": "ok", "config": cfg.name, **summary}
+
+
+# =====================================================================
 #  Full training: H100, up to 24h, resumable from Volume.
 # =====================================================================
 @app.function(
@@ -181,8 +230,12 @@ def _build_providers(config_name: str, eval_cap=None):
     ],
     retries=modal.Retries(initial_delay=0, max_retries=10),
 )
-def train(config_name: str = "moe_interleaved", resume: bool = True):
-    """Full training run. Resumes from /checkpoints/<config>/latest.pt if present."""
+def train(config_name: str = "moe_interleaved", resume: bool = True, sft_init: bool = False):
+    """Full training run. Resumes from /checkpoints/<config>/latest.pt if present.
+
+    With sft_init=True, the policy warm-starts from
+    /checkpoints/<config>_sft/latest.pt (the sft_then_rl arm). Run sft() first.
+    """
     import os
     from pathlib import Path
 
@@ -190,8 +243,18 @@ def train(config_name: str = "moe_interleaved", resume: bool = True):
     # main() appends cfg.name to ckpt_dir, so pass the base, not /<config_name>.
     base_ckpt_dir = Path("/checkpoints")
     latest = base_ckpt_dir / config_name / "latest.pt"
+
+    init_from = None
+    if sft_init:
+        init_from = base_ckpt_dir / f"{config_name}_sft" / "latest.pt"
+        if not init_from.exists():
+            raise FileNotFoundError(
+                f"sft_init=True but {init_from} is missing; run the sft() step first"
+            )
+
     print(f"[train] config={config_name}")
     print(f"[train] resume={resume and latest.exists()} (latest.pt {'present' if latest.exists() else 'absent'})")
+    print(f"[train] init_from={init_from}")
     print(f"[train] ckpt_dir={base_ckpt_dir / config_name}")
 
     from src.rl.train import main
@@ -201,6 +264,7 @@ def train(config_name: str = "moe_interleaved", resume: bool = True):
         config_name=config_name,
         ckpt_dir=str(base_ckpt_dir),
         resume=resume,
+        init_from=str(init_from) if init_from else None,
         **providers,
     )
     checkpoints.commit()
@@ -218,6 +282,8 @@ def cli(target: str = "tests", config_name: str = "moe_interleaved", steps: int 
         modal run modal/modal_app.py::cli --target tests
         modal run modal/modal_app.py::cli --target smoke --steps 50
         modal run --detach modal/modal_app.py::cli --target full --config-name moe_interleaved
+        modal run --detach modal/modal_app.py::cli --target sft --config-name moe_interleaved --steps 500
+        modal run --detach modal/modal_app.py::cli --target sft_then_rl --config-name moe_interleaved
     """
     if target == "tests":
         run_tests.spawn().get()
@@ -228,5 +294,14 @@ def cli(target: str = "tests", config_name: str = "moe_interleaved", steps: int 
         # spawn().get() instead of .remote() — .remote() Function Calls expire after 24h
         out = train.spawn(config_name=config_name).get()
         print(f"\n[cli] train output: {out}")
+    elif target == "sft":
+        out = sft.spawn(config_name=config_name, steps=steps).get()
+        print(f"\n[cli] sft output: {out}")
+    elif target == "sft_then_rl":
+        # Two stages back to back: SFT warm-start, then GRPO from those weights.
+        sft_out = sft.spawn(config_name=config_name, steps=steps).get()
+        print(f"\n[cli] sft output: {sft_out}")
+        rl_out = train.spawn(config_name=config_name, sft_init=True).get()
+        print(f"\n[cli] train output: {rl_out}")
     else:
-        print(f"Unknown target: {target}. Choices: tests | smoke | full")
+        print(f"Unknown target: {target}. Choices: tests | smoke | full | sft | sft_then_rl")
