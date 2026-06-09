@@ -108,15 +108,59 @@ def smoke_train(steps: int = 50, config_name: str = "moe_interleaved_smoke"):
     from src.rl.train import main
 
     print(f"[smoke_train] config={config_name}, steps={steps}")
+    providers = _build_providers(config_name, eval_cap=8)
     summary = main(
         config_name=config_name,
         ckpt_dir="/checkpoints",
         resume=False,
         max_steps=steps,
+        **providers,
     )
     checkpoints.commit()
     print(f"[smoke_train] done: {summary}")
     return {"status": "ok", "steps": steps, "config": config_name, **summary}
+
+
+# =====================================================================
+#  Provider builder: real GSM8K+MATH data + MATH-500/AIME eval.
+# =====================================================================
+def _build_providers(config_name: str, eval_cap=None):
+    """Build the real {tokenizer, sample_batch, eval_fn, probe_input_ids} that
+    `train.main` injects. Imports `datasets`/`transformers` (Modal-only)."""
+    from src.rl.train import load_config, _load_real_tokenizer
+    from src.rl.data import (
+        load_train_mix, load_eval_set, make_sample_batch,
+        make_eval_fn, build_probe_input_ids,
+    )
+
+    cfg = load_config(config_name)
+    tokenizer = _load_real_tokenizer(cfg.model.vocab_size)
+
+    print("[providers] loading GSM8K + MATH L1-L3 train mix ...")
+    train_examples = load_train_mix()
+    print(f"[providers] {len(train_examples)} train examples")
+
+    sample_batch = make_sample_batch(train_examples, seed=cfg.seed)
+    probe_input_ids = build_probe_input_ids(
+        train_examples, tokenizer, n=cfg.probe_size, seed=cfg.seed
+    )
+
+    eval_sets = {
+        "math500": load_eval_set("math500"),
+        "aime2024": load_eval_set("aime2024"),
+    }
+    eval_fn = make_eval_fn(
+        eval_sets,
+        max_examples=eval_cap,
+        max_new_tokens=cfg.grpo.max_completion_len,
+        temperature=0.0,
+    )
+    return {
+        "tokenizer": tokenizer,
+        "sample_batch": sample_batch,
+        "eval_fn": eval_fn,
+        "probe_input_ids": probe_input_ids,
+    }
 
 
 # =====================================================================
@@ -152,10 +196,12 @@ def train(config_name: str = "moe_interleaved", resume: bool = True):
 
     from src.rl.train import main
 
+    providers = _build_providers(config_name)
     summary = main(
         config_name=config_name,
         ckpt_dir=str(base_ckpt_dir),
         resume=resume,
+        **providers,
     )
     checkpoints.commit()
     print(f"[train] done: {summary}")

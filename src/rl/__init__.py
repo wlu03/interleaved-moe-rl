@@ -35,6 +35,19 @@ from .train import (
     main,
     smoke_train_loop,
 )
+from .data import (
+    Example,
+    SYSTEM_PROMPT,
+    format_prompt,
+    gsm8k_gold,
+    math_gold,
+    load_train_mix,
+    load_eval_set,
+    make_sample_batch,
+    build_probe_input_ids,
+    score_completion,
+    make_eval_fn,
+)
 
 __all__ = [
     "extract_gsm8k_answer",
@@ -64,4 +77,15 @@ __all__ = [
     "load_checkpoint",
     "main",
     "smoke_train_loop",
+    "Example",
+    "SYSTEM_PROMPT",
+    "format_prompt",
+    "gsm8k_gold",
+    "math_gold",
+    "load_train_mix",
+    "load_eval_set",
+    "make_sample_batch",
+    "build_probe_input_ids",
+    "score_completion",
+    "make_eval_fn",
 ]
