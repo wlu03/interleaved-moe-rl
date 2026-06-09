@@ -105,11 +105,18 @@ def smoke_train(steps: int = 50, config_name: str = "moe_interleaved_smoke"):
     os.environ["HF_HOME"] = "/cache/hf"
     os.environ["CHECKPOINT_DIR"] = f"/checkpoints/{config_name}"
 
-    # Will be wired up in Milestone 3
+    from src.rl.train import main
+
     print(f"[smoke_train] config={config_name}, steps={steps}")
-    print("[smoke_train] TODO (M3): from src.rl.train import smoke_train_loop")
-    print("[smoke_train]            smoke_train_loop(config_name, steps)")
-    return {"status": "scaffold-only", "steps": steps, "config": config_name}
+    summary = main(
+        config_name=config_name,
+        ckpt_dir="/checkpoints",
+        resume=False,
+        max_steps=steps,
+    )
+    checkpoints.commit()
+    print(f"[smoke_train] done: {summary}")
+    return {"status": "ok", "steps": steps, "config": config_name, **summary}
 
 
 # =====================================================================
@@ -136,18 +143,23 @@ def train(config_name: str = "moe_interleaved", resume: bool = True):
     from pathlib import Path
 
     os.environ["HF_HOME"] = "/cache/hf"
-    ckpt_dir = Path(f"/checkpoints/{config_name}")
-    ckpt_dir.mkdir(parents=True, exist_ok=True)
-
-    latest = ckpt_dir / "latest.pt"
+    # main() appends cfg.name to ckpt_dir, so pass the base, not /<config_name>.
+    base_ckpt_dir = Path("/checkpoints")
+    latest = base_ckpt_dir / config_name / "latest.pt"
     print(f"[train] config={config_name}")
     print(f"[train] resume={resume and latest.exists()} (latest.pt {'present' if latest.exists() else 'absent'})")
-    print(f"[train] ckpt_dir={ckpt_dir}")
+    print(f"[train] ckpt_dir={base_ckpt_dir / config_name}")
 
-    # Will be wired up in Milestone 3
-    print("[train] TODO (M3): from src.rl.train import main")
-    print(f"[train]            main(config_name={config_name!r}, ckpt_dir={str(ckpt_dir)!r}, resume={resume})")
-    return {"status": "scaffold-only", "config": config_name, "ckpt_dir": str(ckpt_dir)}
+    from src.rl.train import main
+
+    summary = main(
+        config_name=config_name,
+        ckpt_dir=str(base_ckpt_dir),
+        resume=resume,
+    )
+    checkpoints.commit()
+    print(f"[train] done: {summary}")
+    return {"status": "ok", "config": config_name, **summary}
 
 
 # =====================================================================

@@ -203,7 +203,11 @@ class TransformerBlock(nn.Module):
     def __init__(self, config: InterleavedMoEConfig, layer_idx: int):
         super().__init__()
         self.layer_idx = layer_idx
-        self.is_moe = (layer_idx % config.moe_every_n_layers == 0)
+        # moe_every_n_layers <= 0 means "all dense" (the dense_baseline config).
+        self.is_moe = (
+            config.moe_every_n_layers > 0
+            and layer_idx % config.moe_every_n_layers == 0
+        )
 
         self.attn_norm = RMSNorm(config.hidden_size, config.rms_norm_eps)
         self.attn = Attention(config)

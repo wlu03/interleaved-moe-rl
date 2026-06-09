@@ -24,6 +24,17 @@ from .grpo import (
     grpo_loss,
     grpo_train_step,
 )
+from .train import (
+    TrainConfig,
+    load_config,
+    register_config,
+    build_model,
+    layer_kinds,
+    save_checkpoint,
+    load_checkpoint,
+    main,
+    smoke_train_loop,
+)
 
 __all__ = [
     "extract_gsm8k_answer",
@@ -44,4 +55,13 @@ __all__ = [
     "shift_completion_mask",
     "grpo_loss",
     "grpo_train_step",
+    "TrainConfig",
+    "load_config",
+    "register_config",
+    "build_model",
+    "layer_kinds",
+    "save_checkpoint",
+    "load_checkpoint",
+    "main",
+    "smoke_train_loop",
 ]
