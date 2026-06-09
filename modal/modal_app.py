@@ -34,6 +34,7 @@ image = (
         "wandb",
         "numpy",
         "scipy",
+        "matplotlib",                 # offline chart rendering in analyze()
         "pytest",
         "tqdm",
     )
@@ -50,9 +51,7 @@ hf_cache = modal.Volume.from_name("interleaved-moe-hf-cache", create_if_missing=
 app = modal.App("interleaved-moe-rl", image=image)
 
 
-# =====================================================================
-#  Pre-flight: pytest on cheap GPU. ALWAYS run this before a long job.
-# =====================================================================
+# Pre-flight: pytest on cheap GPU. ALWAYS run this before a long job.
 @app.function(
     gpu="L40S",            # cheapest GPU, ~$1.95/hr — same CUDA stack as H100
     timeout=15 * 60,       # 15 min ceiling
@@ -88,9 +87,7 @@ def run_tests():
     sys.exit(result.returncode)
 
 
-# =====================================================================
-#  Smoke training: 50 steps, cheapest GPU. Verifies the pipeline runs.
-# =====================================================================
+# Smoke training: 50 steps, cheapest GPU. Verifies the pipeline runs.
 @app.function(
     gpu="L40S",                # smoke test on cheap GPU first
     timeout=60 * 30,           # 30 minutes
@@ -121,9 +118,7 @@ def smoke_train(steps: int = 50, config_name: str = "moe_interleaved_smoke"):
     return {"status": "ok", "steps": steps, "config": config_name, **summary}
 
 
-# =====================================================================
-#  Provider builder: real GSM8K+MATH data + MATH-500/AIME eval.
-# =====================================================================
+# Provider builder: real GSM8K+MATH data + MATH-500/AIME eval.
 def _build_providers(config_name: str, eval_cap=None):
     """Build the real {tokenizer, sample_batch, eval_fn, probe_input_ids} that
     `train.main` injects. Imports `datasets`/`transformers` (Modal-only)."""
@@ -163,9 +158,7 @@ def _build_providers(config_name: str, eval_cap=None):
     }
 
 
-# =====================================================================
-#  SFT warm-start: produces the init checkpoint for the sft_then_rl arm.
-# =====================================================================
+# SFT warm-start: produces the init checkpoint for the sft_then_rl arm.
 @app.function(
     gpu="H100",
     timeout=24 * 60 * 60,
@@ -212,9 +205,7 @@ def sft(config_name: str = "moe_interleaved", steps: int = 500):
     return {"status": "ok", "config": cfg.name, **summary}
 
 
-# =====================================================================
-#  Full training: H100, up to 24h, resumable from Volume.
-# =====================================================================
+# Full training: H100, up to 24h, resumable from Volume.
 @app.function(
     gpu="H100",                                # ~$3.95/hr per-second billed
     timeout=24 * 60 * 60,                      # max allowed per attempt
@@ -272,9 +263,52 @@ def train(config_name: str = "moe_interleaved", resume: bool = True, sft_init: b
     return {"status": "ok", "config": config_name, **summary}
 
 
-# =====================================================================
-#  Local entrypoint: dispatches to the right Modal function.
-# =====================================================================
+# Analysis: render the experiment charts from persisted records.json.
+@app.function(
+    timeout=60 * 15,
+    volumes={"/checkpoints": checkpoints},
+)
+def analyze(config_names: str = "moe_interleaved,dense_baseline"):
+    """Render the six charts into /checkpoints/figures from the records.json
+    each run wrote. `config_names` is a comma-separated list of run dirs."""
+    from pathlib import Path
+
+    from src.analysis import RunRecords, drift_gap_summary, plot_all
+    from src.rl.train import build_model, layer_kinds, load_config
+
+    names = [n.strip() for n in config_names.split(",") if n.strip()]
+    runs = []
+    for name in names:
+        rec = Path("/checkpoints") / name / "records.json"
+        if rec.exists():
+            runs.append(RunRecords.from_file(rec, name=name))
+        else:
+            print(f"[analyze] skipping {name}: {rec} missing")
+
+    if not runs:
+        return {"status": "no-runs"}
+
+    # Color the per-layer plots using whichever config has MoE layers.
+    kinds = None
+    for name in names:
+        cfg = load_config(name)
+        k = layer_kinds(build_model(cfg.model))
+        if "moe" in k.values():
+            kinds = k
+            break
+
+    out_dir = Path("/checkpoints") / "figures"
+    written = plot_all(runs, out_dir, layer_kinds=kinds)
+    checkpoints.commit()
+
+    summaries = {r.name: drift_gap_summary(r) for r in runs}
+    print(f"[analyze] wrote {len(written)} figures to {out_dir}")
+    for name, s in summaries.items():
+        print(f"[analyze] {name}: {s}")
+    return {"status": "ok", "figures": written, "drift_gap": summaries}
+
+
+# Local entrypoint: dispatches to the right Modal function.
 @app.local_entrypoint()
 def cli(target: str = "tests", config_name: str = "moe_interleaved", steps: int = 50):
     """
@@ -284,6 +318,7 @@ def cli(target: str = "tests", config_name: str = "moe_interleaved", steps: int 
         modal run --detach modal/modal_app.py::cli --target full --config-name moe_interleaved
         modal run --detach modal/modal_app.py::cli --target sft --config-name moe_interleaved --steps 500
         modal run --detach modal/modal_app.py::cli --target sft_then_rl --config-name moe_interleaved
+        modal run modal/modal_app.py::cli --target analyze --config-name moe_interleaved,dense_baseline
     """
     if target == "tests":
         run_tests.spawn().get()
@@ -303,5 +338,10 @@ def cli(target: str = "tests", config_name: str = "moe_interleaved", steps: int 
         print(f"\n[cli] sft output: {sft_out}")
         rl_out = train.spawn(config_name=config_name, sft_init=True).get()
         print(f"\n[cli] train output: {rl_out}")
+    elif target == "analyze":
+        # config_name is a comma-separated list of run dirs here.
+        out = analyze.spawn(config_names=config_name).get()
+        print(f"\n[cli] analyze output: {out}")
     else:
-        print(f"Unknown target: {target}. Choices: tests | smoke | full | sft | sft_then_rl")
+        print(f"Unknown target: {target}. "
+              "Choices: tests | smoke | full | sft | sft_then_rl | analyze")

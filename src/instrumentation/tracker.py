@@ -103,6 +103,9 @@ class Tracker:
             flat[f"{prefix}/top1_top2_gap"] = stats.top1_top2_gap
             if stats.token_churn is not None:
                 flat[f"{prefix}/token_churn"] = stats.token_churn
+            # Per-expert load fractions, for the expert-load distribution chart.
+            for e, load in enumerate(stats.expert_load.tolist()):
+                flat[f"{prefix}/load/E{e}"] = load
 
             # Collapse warning (one-shot per layer)
             if (
@@ -172,3 +175,16 @@ class Tracker:
     def get_records(self) -> list[dict[str, Any]]:
         """Return everything emitted so far (useful for tests / offline analysis)."""
         return list(self.local_buffer)
+
+    def dump_records(self, path) -> None:
+        """Write the buffered records to a JSON file for offline analysis.
+
+        This is the input the plotting script reads; W&B isn't required.
+        """
+        import json
+        from pathlib import Path
+
+        path = Path(path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with open(path, "w") as f:
+            json.dump(self.local_buffer, f)

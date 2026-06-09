@@ -175,6 +175,21 @@ def collect_init_snapshot(
     return collect_layer_activations(model, probe_input_ids)
 
 
+def _probe_routing_stats(
+    model: InterleavedMoEModel,
+    probe_input_ids: torch.Tensor,
+) -> dict[int, dict]:
+    """Run a forward on the probe batch and return the per-MoE-layer routing
+    stats (entropy, expert load, top-k indices/weights) for logging."""
+    was_training = model.training
+    model.eval()
+    with torch.no_grad():
+        stats = model(probe_input_ids)["routing_stats"]
+    if was_training:
+        model.train()
+    return stats
+
+
 def main(
     config_name: str = "moe_interleaved",
     ckpt_dir: str | Path = "checkpoints",
@@ -286,6 +301,11 @@ def main(
             if step % cfg.grad_every == 0:
                 tracker.log_gradients(step, model)
 
+            if step % cfg.routing_every == 0:
+                routing_stats = _probe_routing_stats(model, probe_input_ids)
+                if routing_stats:
+                    tracker.log_routing(step, routing_stats)
+
             if step % cfg.eval_every == 0 and eval_fn is not None:
                 tracker.log_step(step, **eval_fn(model, tokenizer, step))
 
@@ -296,8 +316,9 @@ def main(
             if step % cfg.checkpoint_every == 0 and step > start_step:
                 save_checkpoint(model, optimizer, step, latest)
     finally:
-        # Always leave a final checkpoint behind.
+        # Always leave a final checkpoint and the metrics record behind.
         save_checkpoint(model, optimizer, cfg.max_steps, latest)
+        tracker.dump_records(ckpt_dir / "records.json")
         tracker.finish()
 
     return {
