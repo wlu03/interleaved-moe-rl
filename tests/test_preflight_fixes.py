@@ -23,6 +23,7 @@ from src.rl.train import (
     build_model,
     load_checkpoint,
     load_checkpoint_field,
+    load_config,
     main,
     register_config,
     save_checkpoint,
@@ -208,6 +209,34 @@ class TestCheckpointBaselineAndStep:
         # raw step field also reflects completion
         model = build_model(_cfg())
         assert load_checkpoint(model, None, tmp_path / name / "latest.pt") == 3
+
+
+# EXPERIMENT-VALIDITY: the two arms must activate the same FFN params per token,
+# else dense-vs-MoE drift is confounded by capacity (NEXT_STEPS.md §5).
+class TestActiveParamMatching:
+    def _ffn_active_per_token(self, name):
+        cfg = load_config(name).model
+        H = cfg.hidden_size
+        dense_active = 3 * H * cfg.intermediate_size
+        moe_active = cfg.num_experts_per_tok * 3 * H * cfg.expert_intermediate_size
+        return dense_active, moe_active
+
+    def test_moe_layer_matches_dense_layer_active_ffn(self):
+        for name in ["moe_interleaved", "moe_interleaved_smoke"]:
+            dense_active, moe_active = self._ffn_active_per_token(name)
+            assert moe_active == dense_active, (
+                f"{name}: MoE active/token {moe_active} != dense {dense_active}"
+            )
+
+    def test_expert_inter_is_intermediate_over_k(self):
+        cfg = load_config("moe_interleaved").model
+        assert cfg.expert_intermediate_size == cfg.intermediate_size // cfg.num_experts_per_tok
+
+    def test_explicit_override_still_honored(self):
+        from src.rl.train import _moe_config
+        cfg = _moe_config(intermediate_size=1000, num_experts_per_tok=2,
+                          expert_intermediate_size=999)
+        assert cfg.expert_intermediate_size == 999
 
 
 # BLOCKER 11: cold-start zero-advantage steps are surfaced.

@@ -52,7 +52,23 @@ class TrainConfig:
 
 
 def _moe_config(**overrides) -> InterleavedMoEConfig:
-    return replace(InterleavedMoEConfig(), **overrides)
+    """Build a MoE config whose MoE layers activate the SAME number of FFN
+    params per token as a dense layer of the same `intermediate_size`.
+
+    A dense SwiGLU FFN activates 3*H*intermediate params/token; a top-k MoE
+    layer activates k experts, each 3*H*expert_intermediate. Matching them
+    requires expert_intermediate = intermediate / k. Without this the
+    moe_interleaved arm does ~k x more FFN compute than dense_baseline and the
+    dense-vs-MoE drift comparison is confounded by capacity (NEXT_STEPS.md §5).
+    Callers may still override expert_intermediate_size explicitly.
+    """
+    cfg = replace(InterleavedMoEConfig(), **overrides)
+    if "expert_intermediate_size" not in overrides:
+        cfg = replace(
+            cfg,
+            expert_intermediate_size=cfg.intermediate_size // cfg.num_experts_per_tok,
+        )
+    return cfg
 
 
 def _dense_config(**overrides) -> InterleavedMoEConfig:
@@ -81,10 +97,10 @@ _REGISTRY: dict[str, Callable[[], TrainConfig]] = {
         name="moe_interleaved_smoke",
         model=_moe_config(
             hidden_size=64, num_layers=4, num_attention_heads=4,
-            num_kv_heads=2, intermediate_size=128, expert_intermediate_size=128,
+            num_kv_heads=2, intermediate_size=128,
             num_experts=4, num_experts_per_tok=2, moe_every_n_layers=2,
             vocab_size=2048, max_position_embeddings=512,
-        ),
+        ),  # expert_intermediate_size auto = 128 // 2 = 64 (active-param matched)
         grpo=GRPOConfig(group_size=4, max_completion_len=64),
         lr=1e-4, max_steps=50, batch_prompts=4,
         eval_every=25, drift_every=25, checkpoint_every=25, probe_size=64,
