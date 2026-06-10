@@ -37,9 +37,11 @@ except ImportError:
 
 
 # Regex for GSM8K's "#### 42" terminator and the "answer is 42" fallback.
-GSM8K_FINAL_RE = re.compile(r"####\s*(-?\d+(?:\.\d+)?)")
+# Allow thousands separators (real GSM8K answers like "#### 1,000"); the commas
+# are stripped after matching so the full integer survives.
+GSM8K_FINAL_RE = re.compile(r"####\s*(-?\d[\d,]*(?:\.\d+)?)")
 GSM8K_FALLBACK_RE = re.compile(
-    r"(?:answer|the\s+answer)(?:\s+is)?\s*[:=]?\s*(-?\d+(?:\.\d+)?)",
+    r"(?:answer|the\s+answer)(?:\s+is)?\s*[:=]?\s*(-?\d[\d,]*(?:\.\d+)?)",
     re.IGNORECASE,
 )
 
@@ -58,10 +60,10 @@ def extract_gsm8k_answer(text: str) -> str | None:
     """
     m = GSM8K_FINAL_RE.search(text)
     if m:
-        return m.group(1)
+        return m.group(1).replace(",", "")
     matches = GSM8K_FALLBACK_RE.findall(text)
     if matches:
-        return matches[-1]
+        return matches[-1].replace(",", "")
     return None
 
 

@@ -41,9 +41,14 @@ def selective_log_softmax(logits: torch.Tensor, index: torch.Tensor) -> torch.Te
     """log p(index) under softmax(logits), gathered per position.
 
     logits is [..., V], index is [...]; returns [...].
+
+    Uses gather - logsumexp rather than a full log_softmax so we never allocate
+    a second [..., V] tensor. At the real vocab (151936) the log_softmax copy
+    alone is tens of GB per pass; this halves the footprint and is what makes
+    the GRPO step fit on one H100.
     """
-    logps = F.log_softmax(logits, dim=-1)
-    return logps.gather(dim=-1, index=index.unsqueeze(-1)).squeeze(-1)
+    gathered = logits.gather(dim=-1, index=index.unsqueeze(-1)).squeeze(-1)
+    return gathered - torch.logsumexp(logits, dim=-1)
 
 
 def compute_logprobs(model: torch.nn.Module, input_ids: torch.Tensor) -> torch.Tensor:
@@ -181,4 +186,11 @@ def grpo_train_step(
 
     last_metrics["mean_reward"] = float(batch.rewards.mean())
     last_metrics["reward_std"] = float(batch.rewards.std(unbiased=False))
+    # Fraction of rollouts with a nonzero advantage. At cold start every group
+    # tends to earn identical (usually zero) reward, so advantages are all 0 and
+    # the gradient is exactly 0 -- the run silently makes no progress. Surfacing
+    # this lets the operator catch a stuck from-scratch run early.
+    last_metrics["nonzero_adv_frac"] = float(
+        (batch.advantages != 0).float().mean()
+    )
     return last_metrics

@@ -132,52 +132,68 @@ def collect_layer_activations(
     model,
     input_ids: torch.Tensor,
     completion_mask: torch.Tensor | None = None,
+    chunk_size: int = 16,
 ) -> dict[int, torch.Tensor]:
     """
-    Run model.forward and return per-layer activations pooled over completion
-    positions (or all positions if no mask given).
+    Run model.forward and return per-layer activations mean-pooled over the
+    positions selected by `completion_mask` (or all positions if no mask).
 
     Per the drift research, pooling only over assistant-turn / completion
     positions gives a higher-signal probe than pooling over all positions
     (RL changes are localized there).
 
+    The forward is run in row chunks of `chunk_size` and with
+    compute_logits=False, so the full-vocab [B, S, vocab] logits tensor is
+    never materialized -- at the real 4096-row probe that tensor alone is
+    hundreds of GB and would OOM the GPU before the activations are even read.
+
     Args:
         model: an InterleavedMoEModel (or any model with .layers)
         input_ids: [B, S] token ids
-        completion_mask: [B, S] boolean / float mask, 1 on completion tokens
-                         to include in the pool, 0 elsewhere. If None, pool
-                         over all non-pad positions.
+        completion_mask: [B, S] boolean / float mask, 1 on positions to pool,
+                         0 elsewhere. If None, pool over all positions.
+        chunk_size: number of rows per forward pass.
 
     Returns:
         {layer_idx: [B, D]} mean-pooled activations per layer.
     """
-    activations: dict[int, torch.Tensor] = {}
+    chunks: dict[int, list[torch.Tensor]] = {}
     handles = []
 
-    def make_hook(idx: int):
+    def make_hook(idx: int, mask_chunk):
         def hook(module, inputs, output):
             x = output[0] if isinstance(output, tuple) else output
-            # x: [B, S, D]
-            if completion_mask is not None:
-                mask = completion_mask.to(x.dtype).unsqueeze(-1)  # [B, S, 1]
-                pooled = (x * mask).sum(dim=1) / mask.sum(dim=1).clamp_min(1.0)
+            # x: [b, S, D]
+            if mask_chunk is not None:
+                m = mask_chunk.to(x.dtype).unsqueeze(-1)  # [b, S, 1]
+                pooled = (x * m).sum(dim=1) / m.sum(dim=1).clamp_min(1.0)
             else:
                 pooled = x.mean(dim=1)
-            activations[idx] = pooled.detach().float()
+            chunks.setdefault(idx, []).append(pooled.detach().float())
         return hook
 
-    for i, layer in enumerate(model.layers):
-        handles.append(layer.register_forward_hook(make_hook(i)))
-
+    was_training = model.training
+    model.eval()
     try:
-        was_training = model.training
-        model.eval()
         with torch.no_grad():
-            _ = model(input_ids)
+            for start in range(0, input_ids.shape[0], chunk_size):
+                ids_chunk = input_ids[start:start + chunk_size]
+                mask_chunk = (
+                    completion_mask[start:start + chunk_size]
+                    if completion_mask is not None else None
+                )
+                handles = [
+                    layer.register_forward_hook(make_hook(i, mask_chunk))
+                    for i, layer in enumerate(model.layers)
+                ]
+                try:
+                    _ = model(ids_chunk, compute_logits=False)
+                finally:
+                    for h in handles:
+                        h.remove()
+                    handles = []
+    finally:
         if was_training:
             model.train()
-    finally:
-        for h in handles:
-            h.remove()
 
-    return activations
+    return {idx: torch.cat(parts, dim=0) for idx, parts in chunks.items()}

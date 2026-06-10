@@ -250,7 +250,9 @@ def train(config_name: str = "moe_interleaved", resume: bool = True, sft_init: b
 
     from src.rl.train import main
 
-    providers = _build_providers(config_name)
+    # Cap eval to a fixed subset so the no-KV-cache greedy decode of the full
+    # 530-prompt eval set (x20 cycles) doesn't erode the 24h budget.
+    providers = _build_providers(config_name, eval_cap=200)
     summary = main(
         config_name=config_name,
         ckpt_dir=str(base_ckpt_dir),

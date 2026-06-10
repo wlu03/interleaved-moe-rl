@@ -165,38 +165,31 @@ class MoELayer(nn.Module):
 
         topk_weights, topk_indices, stats = self.router(x_flat)
         # topk_weights: [N, K], topk_indices: [N, K]
-
-        # Efficient grouped dispatch:
-        # For each (token, expert_slot) pair, compute expert output and weight it.
-        # Reshape to process all K selections together.
         K = self.num_experts_per_tok
 
-        # Gather expert weights for selected experts
-        # expert_indices_flat: [N*K]
-        expert_indices_flat = topk_indices.view(-1)
+        # Group tokens by expert and run each expert's shared [D, I] weights on
+        # only the tokens routed to it. The earlier approach gathered a
+        # per-(token, slot) copy of the weights (gate_proj[expert_indices] is
+        # [N*K, D, I]); at real N that tensor is hundreds of GB. Looping over the
+        # handful of experts keeps the footprint at O(N*I) activations instead.
+        flat_expert = topk_indices.reshape(-1)                              # [N*K]
+        flat_weight = topk_weights.reshape(-1)                              # [N*K]
+        flat_token = torch.arange(N, device=x.device).repeat_interleave(K)  # [N*K]
 
-        # Gather the gate/up/down projections for selected experts
-        # gate_w: [N*K, D, I], up_w: [N*K, D, I], down_w: [N*K, I, D]
-        gate_w = self.gate_proj[expert_indices_flat]  # [N*K, D, I]
-        up_w = self.up_proj[expert_indices_flat]      # [N*K, D, I]
-        down_w = self.down_proj[expert_indices_flat]  # [N*K, I, D]
+        out = torch.zeros(N, D, dtype=x_flat.dtype, device=x.device)
+        for e in range(self.num_experts):
+            sel = torch.nonzero(flat_expert == e, as_tuple=True)[0]
+            if sel.numel() == 0:
+                continue
+            tokens = flat_token[sel]
+            xe = x_flat[tokens]                          # [m, D]
+            gate_out = xe @ self.gate_proj[e]            # [m, I]
+            up_out = xe @ self.up_proj[e]                # [m, I]
+            expert_out = (F.silu(gate_out) * up_out) @ self.down_proj[e]  # [m, D]
+            expert_out = expert_out * flat_weight[sel].unsqueeze(-1)
+            out.index_add_(0, tokens, expert_out.to(out.dtype))
 
-        # Expand input tokens for each expert slot: [N*K, D]
-        x_expanded = x_flat.unsqueeze(1).expand(-1, K, -1).reshape(N * K, D)
-
-        # Compute SwiGLU per-expert: [N*K, D] @ [N*K, D, I] -> [N*K, I]
-        gate_out = torch.bmm(x_expanded.unsqueeze(1), gate_w).squeeze(1)  # [N*K, I]
-        up_out = torch.bmm(x_expanded.unsqueeze(1), up_w).squeeze(1)      # [N*K, I]
-        hidden = F.silu(gate_out) * up_out                                 # [N*K, I]
-
-        # Down projection: [N*K, I] @ [N*K, I, D] -> [N*K, D]
-        expert_out = torch.bmm(hidden.unsqueeze(1), down_w).squeeze(1)     # [N*K, D]
-
-        # Weight by routing scores and sum across K experts per token
-        weights_flat = topk_weights.view(N * K, 1)  # [N*K, 1]
-        weighted_out = (expert_out * weights_flat).view(N, K, D).sum(dim=1)  # [N, D]
-
-        return weighted_out.view(B, S, D), stats
+        return out.view(B, S, D), stats
 
 
 class TransformerBlock(nn.Module):
@@ -288,11 +281,18 @@ class InterleavedMoEModel(nn.Module):
         self,
         input_ids: torch.Tensor,
         labels: Optional[torch.Tensor] = None,
+        compute_logits: bool = True,
     ) -> dict:
         """
         Args:
             input_ids: [B, S] token ids
             labels: [B, S] optional targets for cross-entropy loss
+            compute_logits: if False, skip the lm_head projection and return
+                logits=None. The vocab projection is a [B, S, vocab_size]
+                tensor (hundreds of GB at the real 4096-row drift probe), so
+                callers that only need hidden states (drift) or routing stats
+                pass False to avoid materializing it. Ignored when labels are
+                given, since the loss needs logits.
 
         Returns:
             dict with keys: logits, loss (if labels), routing_stats
@@ -307,6 +307,9 @@ class InterleavedMoEModel(nn.Module):
                 routing_stats[i] = stats
 
         x = self.norm(x)
+
+        if not compute_logits and labels is None:
+            return {"logits": None, "routing_stats": routing_stats}
 
         # Compute logits
         if self.lm_head is not None:

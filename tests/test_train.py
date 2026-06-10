@@ -171,8 +171,9 @@ class TestMainLoop:
             tokenizer=fake_tokenizer, sample_batch=fake_sample_batch,
             eval_fn=eval_fn, device="cpu",
         )
-        # eval_every=2, max_steps=4 -> steps 0 and 2
-        assert 0 in calls and 2 in calls
+        # eval_every=2, max_steps=4, and step 0 is skipped (no point evaluating
+        # the random-init policy), so eval fires at step 2 only.
+        assert 2 in calls and 0 not in calls
 
     def test_resume_from_checkpoint(self, tmp_path, fake_tokenizer):
         # First run to step 4, leaving latest.pt at step=max_steps.

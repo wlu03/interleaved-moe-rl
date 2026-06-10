@@ -130,15 +130,20 @@ def save_checkpoint(
     optimizer: torch.optim.Optimizer,
     step: int,
     path: Path,
+    extra: Optional[dict] = None,
 ) -> None:
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     # Write to a temp file then rename so we never leave a half-written latest.pt.
     tmp = path.with_suffix(path.suffix + ".tmp")
-    torch.save(
-        {"step": step, "model": model.state_dict(), "optimizer": optimizer.state_dict()},
-        tmp,
-    )
+    payload = {
+        "step": step,
+        "model": model.state_dict(),
+        "optimizer": optimizer.state_dict(),
+    }
+    if extra:
+        payload.update(extra)
+    torch.save(payload, tmp)
     tmp.replace(path)
 
 
@@ -152,6 +157,13 @@ def load_checkpoint(
     if optimizer is not None and "optimizer" in ckpt:
         optimizer.load_state_dict(ckpt["optimizer"])
     return int(ckpt.get("step", 0))
+
+
+def load_checkpoint_field(path: Path, key: str):
+    """Read a single auxiliary field (e.g. the persisted drift baseline) from a
+    checkpoint without touching model/optimizer state. Returns None if absent."""
+    ckpt = torch.load(Path(path), map_location="cpu", weights_only=False)
+    return ckpt.get(key)
 
 
 def _synthetic_data_provider(vocab_size: int):
@@ -170,24 +182,57 @@ def _synthetic_data_provider(vocab_size: int):
 def collect_init_snapshot(
     model: InterleavedMoEModel,
     probe_input_ids: torch.Tensor,
+    probe_mask: torch.Tensor | None = None,
 ) -> dict[int, torch.Tensor]:
     """Per-layer activation snapshot used as the drift baseline."""
-    return collect_layer_activations(model, probe_input_ids)
+    return collect_layer_activations(model, probe_input_ids, probe_mask)
 
 
 def _probe_routing_stats(
     model: InterleavedMoEModel,
     probe_input_ids: torch.Tensor,
+    chunk_size: int = 16,
 ) -> dict[int, dict]:
-    """Run a forward on the probe batch and return the per-MoE-layer routing
-    stats (entropy, expert load, top-k indices/weights) for logging."""
+    """Per-MoE-layer raw routing stats over the probe batch, in the same shape
+    MoELayer emits so RoutingTracker can consume it.
+
+    Runs in row chunks with compute_logits=False so the full-vocab logits
+    tensor is never built. entropy and expert_load are token-count-weighted
+    means across chunks; the small [N, K] topk index/weight tensors are
+    concatenated (K=2 so this is cheap) so the tracker's top1/top2 gap and
+    token churn still work.
+    """
     was_training = model.training
     model.eval()
-    with torch.no_grad():
-        stats = model(probe_input_ids)["routing_stats"]
-    if was_training:
-        model.train()
-    return stats
+    ent: dict[int, torch.Tensor] = {}
+    load: dict[int, torch.Tensor] = {}
+    idxs: dict[int, list] = {}
+    wts: dict[int, list] = {}
+    counts: dict[int, int] = {}
+    try:
+        with torch.no_grad():
+            for start in range(0, probe_input_ids.shape[0], chunk_size):
+                ids = probe_input_ids[start:start + chunk_size]
+                stats = model(ids, compute_logits=False)["routing_stats"]
+                n = ids.shape[0]
+                for li, raw in stats.items():
+                    ent[li] = raw["router_entropy"] * n + ent.get(li, 0.0)
+                    load[li] = raw["expert_load"] * n + (load[li] if li in load else 0.0)
+                    idxs.setdefault(li, []).append(raw["topk_indices"])
+                    wts.setdefault(li, []).append(raw["topk_weights"])
+                    counts[li] = counts.get(li, 0) + n
+    finally:
+        if was_training:
+            model.train()
+    return {
+        li: {
+            "router_entropy": ent[li] / counts[li],
+            "expert_load": load[li] / counts[li],
+            "topk_indices": torch.cat(idxs[li], dim=0),
+            "topk_weights": torch.cat(wts[li], dim=0),
+        }
+        for li in counts
+    }
 
 
 def main(
@@ -245,6 +290,9 @@ def main(
             [p + [pad] * (max_len - len(p)) for p in probe_ids], dtype=torch.long
         )
     probe_input_ids = probe_input_ids.to(dev)
+    # Pool drift over real (non-pad) positions only; padding hidden states are
+    # length-dependent noise that dilutes the signal.
+    probe_mask = (probe_input_ids != tokenizer.pad_token_id).long()
 
     if tracker is None:
         tracker = Tracker(
@@ -273,12 +321,23 @@ def main(
         print(f"[train] initialized policy from SFT checkpoint {init_from}")
 
     kinds = layer_kinds(model)
-    init_acts = collect_init_snapshot(model, probe_input_ids)
 
     if resuming:
         start_step = load_checkpoint(model, optimizer, latest)
         print(f"[train] resumed from {latest} at step {start_step}")
+        # Restore the drift baseline saved on the original fresh run. Recomputing
+        # it here would snapshot the *resumed* weights, making all post-resume
+        # drift meaningless. Fall back to current weights only for legacy
+        # checkpoints that predate baseline persistence.
+        init_acts = load_checkpoint_field(latest, "init_acts")
+        if init_acts is not None:
+            init_acts = {int(k): v.to(dev) for k, v in init_acts.items()}
+        else:
+            init_acts = collect_init_snapshot(model, probe_input_ids, probe_mask)
+    else:
+        init_acts = collect_init_snapshot(model, probe_input_ids, probe_mask)
 
+    last_step = start_step
     last_metrics: dict = {}
     try:
         for step in range(start_step, cfg.max_steps):
@@ -296,6 +355,7 @@ def main(
                 mean_reward=metrics.get("mean_reward", 0.0),
                 reward_std=metrics.get("reward_std", 0.0),
                 clip_frac=metrics.get("clip_frac", 0.0),
+                nonzero_adv_frac=metrics.get("nonzero_adv_frac", 0.0),
             )
 
             if step % cfg.grad_every == 0:
@@ -306,24 +366,30 @@ def main(
                 if routing_stats:
                     tracker.log_routing(step, routing_stats)
 
-            if step % cfg.eval_every == 0 and eval_fn is not None:
+            if step % cfg.eval_every == 0 and step > start_step and eval_fn is not None:
                 tracker.log_step(step, **eval_fn(model, tokenizer, step))
 
             if step % cfg.drift_every == 0 and step > start_step:
-                cur_acts = collect_layer_activations(model, probe_input_ids)
+                cur_acts = collect_layer_activations(model, probe_input_ids, probe_mask)
                 tracker.log_drift(step, init_acts, cur_acts, layer_kinds=kinds)
 
             if step % cfg.checkpoint_every == 0 and step > start_step:
-                save_checkpoint(model, optimizer, step, latest)
+                save_checkpoint(model, optimizer, step, latest,
+                                extra={"init_acts": init_acts})
+
+            last_step = step + 1
     finally:
-        # Always leave a final checkpoint and the metrics record behind.
-        save_checkpoint(model, optimizer, cfg.max_steps, latest)
+        # Stamp the real last-completed step (not cfg.max_steps) so a crash mid-run
+        # leaves a checkpoint that resumes from where it stopped, not one that
+        # falsely reports completion. Persist the drift baseline alongside it.
+        save_checkpoint(model, optimizer, last_step, latest,
+                        extra={"init_acts": init_acts})
         tracker.dump_records(ckpt_dir / "records.json")
         tracker.finish()
 
     return {
         "config": cfg.name,
-        "final_step": cfg.max_steps,
+        "final_step": last_step,
         "last_metrics": last_metrics,
         "ckpt": str(latest),
     }
@@ -340,17 +406,29 @@ def smoke_train_loop(config_name: str = "moe_interleaved_smoke", steps: int = 50
 
 
 def _load_real_tokenizer(vocab_size: int):
-    """Qwen2.5-Math tokenizer on Modal, with a byte-level fallback locally where
-    `transformers` may not be installed."""
+    """Qwen2.5-Math tokenizer on Modal, with a byte-level fallback ONLY when
+    `transformers` isn't installed (the local Py3.9 venv).
+
+    The except is narrowed to ImportError on purpose: a download/network/HF-Hub
+    failure must propagate and crash the run (Modal retries handle it) rather
+    than silently swap in the byte tokenizer and train the real model on
+    garbage token ids. We also assert the real tokenizer's vocab fits the model
+    config, so a mismatched tokenizer fails loudly instead of indexing OOB.
+    """
     try:
         from transformers import AutoTokenizer
-
-        tok = AutoTokenizer.from_pretrained("Qwen/Qwen2.5-Math-1.5B")
-        if tok.pad_token_id is None:
-            tok.pad_token_id = tok.eos_token_id
-        return tok
-    except Exception:
+    except ImportError:
         return _ByteTokenizer(vocab_size)
+
+    tok = AutoTokenizer.from_pretrained("Qwen/Qwen2.5-Math-1.5B")
+    if tok.pad_token_id is None:
+        tok.pad_token_id = tok.eos_token_id
+    if len(tok) > vocab_size:
+        raise ValueError(
+            f"tokenizer vocab {len(tok)} exceeds model vocab_size {vocab_size}; "
+            "update config.vocab_size to match the tokenizer"
+        )
+    return tok
 
 
 class _ByteTokenizer:
